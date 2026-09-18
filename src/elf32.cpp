@@ -186,6 +186,21 @@ std::uint32_t Elf32Image::section_runtime_address(const ElfSection &section, std
     return is_psp_prx() ? load_base + section.address : section.address;
 }
 
+std::uint32_t Elf32Image::required_ram_size(std::uint32_t load_base) const {
+    constexpr std::uint32_t kSmallRam = 32u * 1024u * 1024u;
+    constexpr std::uint32_t kLargeRam = 64u * 1024u * 1024u;
+    std::uint64_t image_end = 0u;
+    for (std::size_t i = 0; i < segments_.size(); ++i) {
+        const auto &segment = segments_[i];
+        if (segment.type != kPtLoad) continue;
+        const std::uint64_t start = GuestMemory::canonical(segment_runtime_address(i, load_base));
+        image_end = std::max(image_end, start + segment.memory_size);
+    }
+    if (image_end <= static_cast<std::uint64_t>(GuestMemory::kPhysicalBase) + kSmallRam) return kSmallRam;
+    if (image_end <= static_cast<std::uint64_t>(GuestMemory::kPhysicalBase) + kLargeRam) return kLargeRam;
+    throw Error("ELF load image does not fit in 64 MiB PSP RAM");
+}
+
 void Elf32Image::load_into(GuestMemory &memory, std::uint32_t load_base) const {
     bool loaded = false;
     for (std::size_t i = 0; i < segments_.size(); ++i) {

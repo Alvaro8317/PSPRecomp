@@ -2,6 +2,7 @@
 #include "psprecomp/codegen_policy.hpp"
 #include "psprecomp/elf32.hpp"
 #include "psprecomp/guest_memory.hpp"
+#include "psprecomp/interpreter.hpp"
 #include "psprecomp/deflate.hpp"
 #include "psprecomp/nid_registry.hpp"
 #include "psprecomp/program_analysis.hpp"
@@ -179,6 +180,223 @@ static void test_nested_direct_chain_context_guard() {
 
     psprecomp::set_runtime_starvation_hook(nullptr, 0u);
     psprecomp::set_runtime_thread_identity(-1, "none");
+}
+
+// Minimal Allegrex assembler for the interpreter fixtures below. Hand-built
+// guest code keeps these tests independent of the code generator.
+static std::uint32_t mips_i(std::uint32_t op, std::uint32_t rs, std::uint32_t rt, std::uint32_t immediate) {
+    return (op << 26u) | (rs << 21u) | (rt << 16u) | (immediate & 0xFFFFu);
+}
+static std::uint32_t mips_r(std::uint32_t rs, std::uint32_t rt, std::uint32_t rd,
+                            std::uint32_t sa, std::uint32_t function) {
+    return (rs << 21u) | (rt << 16u) | (rd << 11u) | (sa << 6u) | function;
+}
+static std::uint32_t mips_jump(std::uint32_t op, std::uint32_t target) {
+    return (op << 26u) | ((target >> 2u) & 0x03FFFFFFu);
+}
+
+static constexpr std::uint32_t kInterpreterBase = 0x08810000u;
+static constexpr std::uint32_t kInterpreterExit = 0x08811000u;
+static constexpr std::uint32_t kInterpreterScratch = 0x08820000u;
+
+static std::uint32_t interpreter_exit_hits = 0u;
+static std::uint32_t interpreter_exit_ra = 0u;
+static void interpreter_exit_function(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
+    ++interpreter_exit_hits;
+    interpreter_exit_ra = ctx.gpr[31];
+    runtime.stop("interpreter reached registered code");
+}
+
+static void load_program(psprecomp::Runtime &runtime, std::uint32_t base,
+                         const std::vector<std::uint32_t> &words) {
+    for (std::size_t index = 0; index < words.size(); ++index)
+        runtime.memory().store32(base + static_cast<std::uint32_t>(index) * 4u, words[index]);
+}
+
+static void test_interpreter_delay_slots_and_branch_likely() {
+    psprecomp::Runtime runtime;
+    runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
+    load_program(runtime, kInterpreterBase, {
+        mips_i(0x09u, 0u, 8u, 5u),        // addiu t0, zero, 5
+        mips_i(0x14u, 8u, 8u, 3u),        // beql  t0, t0, +3  (taken)
+        mips_i(0x09u, 8u, 8u, 10u),       // addiu t0, t0, 10   delay slot
+        mips_i(0x09u, 0u, 8u, 99u),       // addiu t0, zero, 99 (skipped)
+        0u,                               // nop
+        mips_i(0x14u, 8u, 0u, 3u),        // beql  t0, zero, +3 (not taken)
+        mips_i(0x09u, 0u, 9u, 77u),       // addiu t1, zero, 77 annulled delay slot
+        mips_i(0x09u, 0u, 10u, 1u),       // addiu t2, zero, 1
+        mips_i(0x04u, 0u, 0u, 3u),        // beq   zero, zero, +3 (taken)
+        mips_i(0x09u, 10u, 10u, 4u),      // addiu t2, t2, 4    delay slot
+        mips_i(0x09u, 0u, 10u, 60u),      // addiu t2, zero, 60 (skipped)
+        0u,                               // nop
+        mips_r(31u, 0u, 0u, 0u, 0x08u),   // jr    ra
+        mips_i(0x09u, 9u, 9u, 3u),        // addiu t1, t1, 3    delay slot
+    });
+
+    psprecomp::AllegrexContext ctx{};
+    ctx.pc = kInterpreterBase;
+    ctx.gpr[31] = kInterpreterExit;
+    const auto exit = psprecomp::interpret_allegrex(runtime, ctx);
+    require(exit == psprecomp::InterpreterExit::Dispatch,
+            "Interpreter did not hand a registered address back to the dispatcher");
+    require(ctx.pc == kInterpreterExit, "Interpreter left with the wrong guest PC");
+    require(ctx.gpr[8] == 15u, "Interpreter did not execute a taken branch delay slot");
+    require(ctx.gpr[9] == 3u, "Branch-likely annulment or the JR delay slot is wrong");
+    require(ctx.gpr[10] == 5u, "Interpreter mishandled an ordinary branch delay slot");
+}
+
+static void test_interpreter_unaligned_word_access() {
+    psprecomp::Runtime runtime;
+    runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
+    runtime.memory().store32(kInterpreterScratch + 0x00u, 0x11223344u);
+    runtime.memory().store32(kInterpreterScratch + 0x10u, 0x11223344u);
+    runtime.memory().store32(kInterpreterScratch + 0x20u, 0x11223344u);
+    load_program(runtime, kInterpreterBase, {
+        mips_i(0x22u, 4u, 8u, 0x01u),     // lwl t0, 1(a0)
+        mips_i(0x26u, 4u, 9u, 0x02u),     // lwr t1, 2(a0)
+        mips_i(0x2Au, 5u, 10u, 0x11u),    // swl t2, 0x11(a1)
+        mips_i(0x2Eu, 6u, 10u, 0x22u),    // swr t2, 0x22(a2)
+        mips_r(31u, 0u, 0u, 0u, 0x08u),   // jr  ra
+        0u,                               // nop
+    });
+
+    psprecomp::AllegrexContext ctx{};
+    ctx.pc = kInterpreterBase;
+    ctx.gpr[31] = kInterpreterExit;
+    ctx.gpr[4] = kInterpreterScratch;
+    ctx.gpr[5] = kInterpreterScratch;
+    ctx.gpr[6] = kInterpreterScratch;
+    ctx.gpr[8] = 0xAABBCCDDu;
+    ctx.gpr[9] = 0xAABBCCDDu;
+    ctx.gpr[10] = 0x99887766u;
+    require(psprecomp::interpret_allegrex(runtime, ctx) == psprecomp::InterpreterExit::Dispatch,
+            "Unaligned-access fixture did not reach the registered exit");
+    require(ctx.gpr[8] == 0x3344CCDDu, "LWL merged the wrong bytes");
+    require(ctx.gpr[9] == 0xAABB1122u, "LWR merged the wrong bytes");
+    require(runtime.memory().load32(kInterpreterScratch + 0x10u) == 0x11229988u,
+            "SWL wrote the wrong bytes");
+    require(runtime.memory().load32(kInterpreterScratch + 0x20u) == 0x77663344u,
+            "SWR wrote the wrong bytes");
+}
+
+static void test_interpreter_hi_lo() {
+    psprecomp::Runtime runtime;
+    runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
+    load_program(runtime, kInterpreterBase, {
+        mips_r(8u, 9u, 0u, 0u, 0x19u),    // multu t0, t1
+        mips_r(0u, 0u, 2u, 0u, 0x10u),    // mfhi  v0
+        mips_r(0u, 0u, 3u, 0u, 0x12u),    // mflo  v1
+        mips_r(12u, 13u, 0u, 0u, 0x18u),  // mult  t4, t5
+        mips_r(0u, 0u, 4u, 0u, 0x12u),    // mflo  a0
+        mips_r(0u, 0u, 5u, 0u, 0x10u),    // mfhi  a1
+        mips_r(24u, 25u, 0u, 0u, 0x1Au),  // div   t8, t9
+        mips_r(0u, 0u, 6u, 0u, 0x12u),    // mflo  a2
+        mips_r(0u, 0u, 7u, 0u, 0x10u),    // mfhi  a3
+        mips_r(8u, 9u, 0u, 0u, 0x1Cu),    // madd  t0, t1
+        mips_r(0u, 0u, 16u, 0u, 0x12u),   // mflo  s0
+        mips_r(0u, 0u, 17u, 0u, 0x10u),   // mfhi  s1
+        mips_r(31u, 0u, 0u, 0u, 0x08u),   // jr    ra
+        0u,                               // nop
+    });
+
+    psprecomp::AllegrexContext ctx{};
+    ctx.pc = kInterpreterBase;
+    ctx.gpr[31] = kInterpreterExit;
+    ctx.gpr[8] = 0x00010000u;
+    ctx.gpr[9] = 0x00010000u;
+    ctx.gpr[12] = static_cast<std::uint32_t>(-3);
+    ctx.gpr[13] = 5u;
+    ctx.gpr[24] = static_cast<std::uint32_t>(-7);
+    ctx.gpr[25] = 2u;
+    require(psprecomp::interpret_allegrex(runtime, ctx) == psprecomp::InterpreterExit::Dispatch,
+            "HI/LO fixture did not reach the registered exit");
+    require(ctx.gpr[2] == 1u && ctx.gpr[3] == 0u, "MULTU did not fill HI/LO");
+    require(ctx.gpr[4] == 0xFFFFFFF1u && ctx.gpr[5] == 0xFFFFFFFFu, "MULT sign extension is wrong");
+    require(ctx.gpr[6] == 0xFFFFFFFDu && ctx.gpr[7] == 0xFFFFFFFFu, "DIV quotient/remainder is wrong");
+    require(ctx.gpr[16] == 0xFFFFFFFDu && ctx.gpr[17] == 0u, "MADD did not accumulate into HI/LO");
+}
+
+static std::uint32_t mips_cop1(std::uint32_t rs, std::uint32_t rt, std::uint32_t rd,
+                               std::uint32_t sa, std::uint32_t function) {
+    return (0x11u << 26u) | (rs << 21u) | (rt << 16u) | (rd << 11u) | (sa << 6u) | function;
+}
+
+static void test_interpreter_floating_point() {
+    psprecomp::Runtime runtime;
+    runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
+    load_program(runtime, kInterpreterBase, {
+        mips_cop1(0x04u, 8u, 0u, 0u, 0u),     // mtc1   t0, f0
+        mips_cop1(0x04u, 9u, 1u, 0u, 0u),     // mtc1   t1, f1
+        mips_cop1(0x10u, 1u, 0u, 2u, 0x00u),  // add.s  f2, f0, f1
+        mips_cop1(0x00u, 2u, 2u, 0u, 0u),     // mfc1   v0, f2
+        mips_cop1(0x10u, 1u, 0u, 0u, 0x34u),  // c.lt.s f0, f1
+        mips_cop1(0x08u, 1u, 0u, 0u, 2u),     // bc1t   +2
+        0u,                                   // nop    delay slot
+        mips_i(0x09u, 0u, 3u, 111u),          // addiu  v1, zero, 111 (skipped)
+        (0x37u << 26u) | (6u << 23u) | (0u << 16u) | 7u,   // viim.s S000, 7
+        (0x12u << 26u) | (3u << 21u) | (4u << 16u) | 0u,   // mfv    a0, S000
+        mips_r(31u, 0u, 0u, 0u, 0x08u),       // jr     ra
+        0u,                                   // nop
+    });
+
+    psprecomp::AllegrexContext ctx{};
+    ctx.pc = kInterpreterBase;
+    ctx.gpr[31] = kInterpreterExit;
+    ctx.gpr[8] = std::bit_cast<std::uint32_t>(1.5f);
+    ctx.gpr[9] = std::bit_cast<std::uint32_t>(2.25f);
+    ctx.eat_vfpu_prefixes();
+    require(psprecomp::interpret_allegrex(runtime, ctx) == psprecomp::InterpreterExit::Dispatch,
+            "Floating-point fixture did not reach the registered exit");
+    require(ctx.gpr[2] == std::bit_cast<std::uint32_t>(3.75f), "ADD.S produced the wrong result");
+    require(ctx.gpr[3] == 0u, "BC1T did not branch on the FPU condition");
+    require(ctx.gpr[4] == std::bit_cast<std::uint32_t>(7.0f), "VIIM/MFV did not move a VFPU scalar");
+}
+
+static void test_interpreter_dispatch_fallback() {
+    psprecomp::Runtime runtime;
+    runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
+    load_program(runtime, kInterpreterBase, {
+        mips_i(0x09u, 0u, 2u, 0x1234u),      // addiu v0, zero, 0x1234
+        mips_jump(0x03u, kInterpreterExit),  // jal  kInterpreterExit
+        mips_i(0x09u, 0u, 3u, 7u),           // addiu v1, zero, 7  delay slot
+        0u,                                  // nop
+    });
+
+    interpreter_exit_hits = 0u;
+    interpreter_exit_ra = 0u;
+    psprecomp::reset_interpreter_stats();
+    runtime.run(kInterpreterBase, 8u);
+    require(interpreter_exit_hits == 1u,
+            "Dispatch loop did not interpret its way into the registered function");
+    require(interpreter_exit_ra == kInterpreterBase + 0x0Cu,
+            "Interpreted JAL stored the wrong return address");
+    require(runtime.cpu().gpr[2] == 0x1234u && runtime.cpu().gpr[3] == 7u,
+            "Interpreted JAL delay slot did not run");
+    require(runtime.stop_reason() == "interpreter reached registered code",
+            "Interpreted run did not stop inside the registered function");
+    const auto stats = psprecomp::interpreter_stats();
+    require(stats.instructions == 3u && stats.entries == 1u && stats.distinct_entry_addresses == 1u,
+            "Interpreter did not report what it executed");
+}
+
+static void test_interpreter_budget_and_disable() {
+    psprecomp::Runtime runtime;
+    load_program(runtime, kInterpreterBase, {
+        mips_i(0x04u, 0u, 0u, 0xFFFFu),   // beq zero, zero, -1  (self loop)
+        0u,                               // nop
+    });
+
+    psprecomp::AllegrexContext ctx{};
+    ctx.pc = kInterpreterBase;
+    require(psprecomp::interpret_allegrex(runtime, ctx, 10u) == psprecomp::InterpreterExit::Budget,
+            "Interpreter did not return to the dispatcher on its instruction budget");
+    require(ctx.pc == kInterpreterBase, "Budgeted interpreter exit left the wrong guest PC");
+
+    psprecomp::set_interpreter_fallback_enabled(false);
+    runtime.run(kInterpreterBase, 4u);
+    psprecomp::set_interpreter_fallback_enabled(true);
+    require(runtime.stop_reason() == "No recompiled function registered at 0x08810000",
+            "PSPRECOMP_NO_INTERPRETER did not restore the strict dispatch stop");
 }
 
 static void test_import_return_context_guard() {
@@ -735,7 +953,9 @@ static void test_automatic_cross_unit_tail_chaining() {
     require(text.find("AotHotRegisterCache") == std::string::npos &&
             text.find("hot_regs") == std::string::npos,
             "Generated unit still carries the removed hot-register cache");
-    require(text.find("#include \"generated_units.hpp\"") != std::string::npos,
+    // The unit sources are named generated_unit_NNNN.cpp, but their symbols and
+    // the shared declaration header carry the corpus symbol prefix.
+    require(text.find("#include \"recomp_units.hpp\"") != std::string::npos,
             "Automatic codegen did not include cross-unit native declarations");
     require(text.find("runtime.register_generated_unit(0u, 0x08804000u, 64u, &recomp_unit_0000, &recomp_unit_0000_entry);") != std::string::npos,
             "Automatic codegen did not register the dense generated-unit fast table");
@@ -804,6 +1024,12 @@ int main() {
         test_import_return_context_guard();
         test_chained_call_context_guard();
         test_nested_direct_chain_context_guard();
+        test_interpreter_delay_slots_and_branch_likely();
+        test_interpreter_unaligned_word_access();
+        test_interpreter_hi_lo();
+        test_interpreter_floating_point();
+        test_interpreter_dispatch_fallback();
+        test_interpreter_budget_and_disable();
 
         psprecomp::GuestMemory mem;
         mem.store32(0x08800000u, 0x12345678u);
@@ -966,6 +1192,17 @@ int main() {
         const auto vocp = psprecomp::decode_allegrex(0xD0440020u);
         require(vocp.kind == psprecomp::OpcodeKind::Vocp && vocp.mnemonic == "vocp",
                 "VOCP.S classification failed");
+        const auto vsocp = psprecomp::decode_allegrex(0xD0456041u);
+        require(vsocp.kind == psprecomp::OpcodeKind::Vsocp && vsocp.mnemonic == "vsocp",
+                "VSOCP classification failed");
+        const auto vsgn = psprecomp::decode_allegrex(0xD04A0020u);
+        require(vsgn.kind == psprecomp::OpcodeKind::Vsgn && vsgn.mnemonic == "vsgn",
+                "VSGN classification failed");
+        require(psprecomp::decode_allegrex(0x0222001Cu).kind == psprecomp::OpcodeKind::Madd, "MADD decode failed");
+        require(psprecomp::decode_allegrex(0x0222001Du).kind == psprecomp::OpcodeKind::Maddu, "MADDU decode failed");
+        require(psprecomp::decode_allegrex(0x0222002Eu).kind == psprecomp::OpcodeKind::Msub, "MSUB decode failed");
+        require(psprecomp::decode_allegrex(0x0222002Fu).kind == psprecomp::OpcodeKind::Msubu, "MSUBU decode failed");
+        require(psprecomp::decode_allegrex(0x000001CDu).kind == psprecomp::OpcodeKind::Break, "BREAK decode failed");
         const auto vtfm = psprecomp::decode_allegrex(0xF104A003u);
         require(vtfm.kind == psprecomp::OpcodeKind::Vtfm && vtfm.mnemonic == "vtfm",
                 "VTFM3.T classification failed");

@@ -13,7 +13,32 @@ namespace psprecomp {
 namespace {
 
 std::vector<ExecutableRange> executable_ranges_for(const Elf32Image &elf, std::uint32_t load_base) {
+    constexpr std::uint32_t kShtProgbits = 1u;
+    constexpr std::uint32_t kShfExecinstr = 4u;
     std::vector<ExecutableRange> ranges;
+    // Commercial PSP executables commonly ship a single RWX PT_LOAD that also
+    // holds .rodata/.data. When section headers describe the code, restrict the
+    // analysis to SHF_EXECINSTR sections that are backed by a loaded segment so
+    // data words are never decoded as instructions. Zero-sized placeholder
+    // sections (e.g. overlay descriptors) are ignored.
+    for (const auto &section : elf.sections()) {
+        if (section.type != kShtProgbits || (section.flags & kShfExecinstr) == 0u || section.size == 0u) continue;
+        const std::uint32_t start = elf.section_runtime_address(section, load_base);
+        const std::uint64_t end64 = static_cast<std::uint64_t>(start) + section.size;
+        if (end64 > std::numeric_limits<std::uint32_t>::max()) continue;
+        bool loaded = false;
+        for (std::size_t i = 0; i < elf.segments().size() && !loaded; ++i) {
+            const auto &segment = elf.segments()[i];
+            if (segment.type != 1u || segment.file_size == 0u) continue;
+            const std::uint64_t segment_start = elf.segment_runtime_address(i, load_base);
+            loaded = start >= segment_start && end64 <= segment_start + segment.file_size;
+        }
+        if (loaded) ranges.push_back({start, static_cast<std::uint32_t>(end64)});
+    }
+    if (!ranges.empty()) {
+        std::sort(ranges.begin(), ranges.end(), [](const auto &a, const auto &b) { return a.start < b.start; });
+        return ranges;
+    }
     for (std::size_t i = 0; i < elf.segments().size(); ++i) {
         const auto &segment = elf.segments()[i];
         if (segment.type != 1u || (segment.flags & 1u) == 0u || segment.file_size == 0u) continue;
@@ -208,6 +233,7 @@ void propagate_constant(const DecodedInstruction &decoded,
     case OpcodeKind::Unsupported:
     case OpcodeKind::Vfpu:
     case OpcodeKind::Syscall:
+    case OpcodeKind::Break:
         clear_all_constants(constants);
         break;
     default:
@@ -286,6 +312,41 @@ void collect_relocated_data_code_pointers(const Elf32Image &elf,
     }
 }
 
+// Absolute (non-relocatable) executables carry no R_MIPS_32 records, so function
+// pointers stored in .data/.rodata (vtables, task tables, callbacks) are only
+// visible as raw words. Scan allocated non-executable sections and accept a word
+// only when its target has a function shape: a stack-frame prologue
+// (addiu $sp, $sp, -N) or the instruction pair right after a `jr $ra`. The shape
+// filter keeps coincidental mid-function values out of the seed set.
+void collect_section_data_code_pointers(const Elf32Image &elf,
+                                        const GuestMemory &memory,
+                                        std::uint32_t load_base,
+                                        const std::vector<ExecutableRange> &ranges,
+                                        std::map<std::uint32_t, std::string> &seeds) {
+    constexpr std::uint32_t kShtProgbits = 1u;
+    constexpr std::uint32_t kShfAlloc = 2u;
+    constexpr std::uint32_t kShfExecinstr = 4u;
+    const auto function_shaped = [&](std::uint32_t target) {
+        const std::uint32_t word = memory.load32(target);
+        const bool stack_prologue = (word >> 16u) == 0x27BDu && (word & 0x8000u) != 0u;
+        const bool after_return = is_executable_address(ranges, target - 8u) &&
+                                  memory.load32(target - 8u) == 0x03E00008u;
+        return stack_prologue || after_return;
+    };
+    for (const auto &section : elf.sections()) {
+        if (section.type != kShtProgbits || (section.flags & kShfAlloc) == 0u ||
+            (section.flags & kShfExecinstr) != 0u || section.size < 4u) continue;
+        const std::uint32_t start = elf.section_runtime_address(section, load_base);
+        if (!memory.contains(start, section.size)) continue;
+        const std::uint32_t size = section.size & ~3u;
+        for (std::uint32_t offset = 0u; offset < size; offset += 4u) {
+            const std::uint32_t value = memory.load32(start + offset);
+            if (!is_executable_address(ranges, value) || !function_shaped(value)) continue;
+            add_seed(seeds, ranges, value, "data_section_code_pointer");
+        }
+    }
+}
+
 std::map<std::uint32_t, std::string> collect_initial_seeds(const Elf32Image &elf,
                                                            const GuestMemory &memory,
                                                            std::uint32_t load_base,
@@ -303,6 +364,7 @@ std::map<std::uint32_t, std::string> collect_initial_seeds(const Elf32Image &elf
     }
     collect_materialized_code_pointers(memory, ranges, seeds);
     collect_relocated_data_code_pointers(elf, memory, load_base, ranges, seeds);
+    if (!elf.is_psp_prx()) collect_section_data_code_pointers(elf, memory, load_base, ranges, seeds);
     // R_MIPS_32 relocations are the authoritative source for function pointers
     // stored in read-only tables embedded in the executable segment (init arrays,
     // vtables, callbacks). Scanning raw RX words would confuse J opcodes with pointers.

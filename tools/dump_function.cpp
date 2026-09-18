@@ -13,7 +13,7 @@ static std::uint32_t parse(std::string s) {
 }
 int main(int argc,char**argv){
  if(argc<4){std::cerr<<"usage: dump_function elf address count\n";return 2;}
- auto elf=psprecomp::Elf32Image::from_file(argv[1]); psprecomp::GuestMemory mem; (void)elf.load_and_relocate(mem);
+ auto elf=psprecomp::Elf32Image::from_file(argv[1]); psprecomp::GuestMemory mem(elf.required_ram_size()); (void)elf.load_and_relocate(mem);
  auto pc=parse(argv[2]); auto count=parse(argv[3]);
  for(std::uint32_t i=0;i<count;i++,pc+=4){ auto w=mem.load32(pc); auto d=psprecomp::decode_allegrex(w);
  std::cout<<psprecomp::hex32(pc)<<" "<<psprecomp::hex32(w)<<" "<<d.mnemonic

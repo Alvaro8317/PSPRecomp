@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cctype>
 #include <charconv>
 #include <filesystem>
@@ -202,6 +203,23 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
     case psprecomp::OpcodeKind::Multu:
         out << "    { const std::uint64_t product = static_cast<std::uint64_t>(" << reg(d.rs) << ") * static_cast<std::uint64_t>(" << reg(d.rt) << "); "
             << "ctx.lo = static_cast<std::uint32_t>(product); ctx.hi = static_cast<std::uint32_t>(product >> 32u); }\n";
+        break;
+    case psprecomp::OpcodeKind::Madd:
+    case psprecomp::OpcodeKind::Msub:
+        out << "    { const std::int64_t product = static_cast<std::int64_t>(static_cast<std::int32_t>(" << reg(d.rs) << ")) * "
+            << "static_cast<std::int64_t>(static_cast<std::int32_t>(" << reg(d.rt) << ")); "
+            << "const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; "
+            << "const std::uint64_t result = accumulator " << (d.kind == psprecomp::OpcodeKind::Madd ? '+' : '-')
+            << " static_cast<std::uint64_t>(product); "
+            << "ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }\n";
+        break;
+    case psprecomp::OpcodeKind::Maddu:
+    case psprecomp::OpcodeKind::Msubu:
+        out << "    { const std::uint64_t product = static_cast<std::uint64_t>(" << reg(d.rs) << ") * static_cast<std::uint64_t>(" << reg(d.rt) << "); "
+            << "const std::uint64_t accumulator = (static_cast<std::uint64_t>(ctx.hi) << 32u) | ctx.lo; "
+            << "const std::uint64_t result = accumulator " << (d.kind == psprecomp::OpcodeKind::Maddu ? '+' : '-')
+            << " product; "
+            << "ctx.lo = static_cast<std::uint32_t>(result); ctx.hi = static_cast<std::uint32_t>(result >> 32u); }\n";
         break;
     case psprecomp::OpcodeKind::Div:
         // $zero is emitted as a literal 0u.  If it is also the divisor, do not
@@ -564,6 +582,43 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
             << length << "u);\n";
         break;
     }
+    case psprecomp::OpcodeKind::Vsgn: {
+        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
+        const std::uint32_t length = size_code + 1u;
+        const std::uint32_t destination = d.word & 0x7Fu;
+        const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+        out << "    { float vfpu_s[4]{}, vfpu_d[4]{};\n"
+            << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_s, " << source << "u, " << length << "u, 0u);\n"
+            << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) vfpu_d[i] = vfpu_s[i] > 0.0f ? 1.0f : (vfpu_s[i] < 0.0f ? -1.0f : 0.0f);\n"
+            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_d, " << destination << "u, " << length << "u); }\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Vsocp: {
+        // VSOCP widens each source lane x into the saturated pair (1 - x, x):
+        // single -> pair, pair -> quad. Larger inputs are undefined on hardware.
+        const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
+        const std::uint32_t length = size_code + 1u;
+        const std::uint32_t destination = d.word & 0x7Fu;
+        const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+        if (length > 2u) {
+            out << "    rt.unsupported(" << psprecomp::hex32(pc) << "u, " << psprecomp::hex32(d.word)
+                << "u, \"vsocp with triple/quad source\"); return;\n";
+            break;
+        }
+        out << "    { float vfpu_s[4]{}, vfpu_d[4]{};\n"
+            << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_s, " << source << "u, " << length << "u, 0u);\n"
+            << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) {\n"
+            << "        const float vfpu_inverse = 1.0f - vfpu_s[i];\n"
+            << "        vfpu_d[i * 2u] = vfpu_inverse < 0.0f ? 0.0f : (vfpu_inverse > 1.0f ? 1.0f : vfpu_inverse);\n"
+            << "        vfpu_d[i * 2u + 1u] = vfpu_s[i] < 0.0f ? 0.0f : (vfpu_s[i] > 1.0f ? 1.0f : vfpu_s[i]);\n"
+            << "      }\n"
+            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_d, " << destination << "u, " << (length * 2u) << "u); }\n";
+        break;
+    }
+    case psprecomp::OpcodeKind::Break:
+        out << "    rt.unsupported(" << psprecomp::hex32(pc) << "u, " << psprecomp::hex32(d.word)
+            << "u, \"guest break trap\"); return;\n";
+        break;
     case psprecomp::OpcodeKind::VfpuHorizontal: {
         const std::uint32_t size_code = ((d.word >> 7u) & 1u) | (((d.word >> 15u) & 1u) << 1u);
         const std::uint32_t length = size_code + 1u;
@@ -825,9 +880,14 @@ std::string branch_condition(const psprecomp::DecodedInstruction &d) {
     }
 }
 
+// Corpus symbol prefix. The main executable keeps the historical names; an
+// overlay corpus passes its own prefix, which names both its registration entry
+// point and its units, so corpora stay distinguishable in one process.
+std::string g_symbol_prefix = "recomp";
+
 std::string generated_unit_cpp_name(std::uint32_t unit) {
     std::ostringstream name;
-    name << "recomp_unit_" << std::setfill('0') << std::setw(4) << unit;
+    name << g_symbol_prefix << "_unit_" << std::setfill('0') << std::setw(4) << unit;
     return name.str();
 }
 
@@ -855,7 +915,8 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
                  std::uint32_t executable_base = 0u,
                  std::uint32_t unit_span_bytes = 0u,
                  const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids = nullptr,
-                 const std::set<std::uint32_t> *import_stubs = nullptr) {
+                 const std::set<std::uint32_t> *import_stubs = nullptr,
+                 const std::set<std::uint32_t> *unit_indices = nullptr) {
     if (labels.contains(target)) {
         body << indent << "goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
         return;
@@ -876,7 +937,12 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
     // chain table and indexes the tiny unit table instead. A bucket containing
     // an import/HLE/host replacement is marked overridden at registration time
     // and invoke_chained_unit() falls back to the exact per-PC lookup there.
-    if (unit_span_bytes != 0u && target >= executable_base) {
+    // Only chain directly into units that were actually emitted. A fixed jump
+    // outside the analyzed code (e.g. into a runtime-loaded overlay slot) has
+    // no generated symbol and must go through the runtime lookup instead.
+    const bool direct_unit = unit_span_bytes != 0u && target >= executable_base &&
+        (unit_indices == nullptr || unit_indices->contains((target - executable_base) / unit_span_bytes));
+    if (direct_unit) {
         const std::uint32_t unit = (target - executable_base) / unit_span_bytes;
         body << indent << "(void)" << direct_unit_chain_expression(unit, target, direct_entry_ids)
              << "; return;\n";
@@ -896,6 +962,7 @@ struct GeneratedFunctionInput {
     std::uint32_t unit_span_bytes{};
     const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids{};
     const std::set<std::uint32_t> *import_stubs{};
+    const std::set<std::uint32_t> *unit_indices{};
 };
 
 std::string emit_function_source(const GeneratedFunctionInput &function,
@@ -1019,16 +1086,16 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     if (likely_branch) {
                         body << "    if (" << condition << ") {\n"
                              << emit_regular(slot, pc + 4u);
-                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_indices);
                         body << "    }\n";
-                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_indices);
                     } else {
                         body << "    { const bool branch_taken = " << condition << ";\n"
                              << emit_regular(slot, pc + 4u)
                              << "      if (branch_taken) {\n";
-                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_indices);
                         body << "      }\n";
-                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_indices);
                         body << "    }\n";
                     }
                 } else if (decoded.kind == psprecomp::OpcodeKind::J ||
@@ -1039,7 +1106,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                     }
                     body << emit_regular(slot, pc + 4u);
                     if (decoded.kind == psprecomp::OpcodeKind::J) {
-                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, function.unit_indices);
                     } else if (function.entry_labels.contains(target)) {
                         // Fixed same-unit JAL: the destination is already a C++
                         // label. Going through ctx.pc + LOCAL_DISPATCH needlessly
@@ -1056,12 +1123,14 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
                         if (target_is_import) {
                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
                                  << "    return;\n";
-                            continue;
+                            break;
                         }
                         // Otherwise run the callee inline and resume locally only
                         // if it came back to our return address.
                         const bool direct_unit = function.unit_span_bytes != 0u &&
-                            target >= function.executable_base;
+                            target >= function.executable_base &&
+                            (function.unit_indices == nullptr || function.unit_indices->contains(
+                                (target - function.executable_base) / function.unit_span_bytes));
                         const std::uint32_t target_unit = direct_unit
                             ? (target - function.executable_base) / function.unit_span_bytes : 0u;
                         if (!direct_unit)
@@ -1169,7 +1238,7 @@ int generate_manual(const std::filesystem::path &elf_path,
         for (auto &function : functions) if (function.address < load_base) function.address += load_base;
     }
 
-    psprecomp::GuestMemory memory;
+    psprecomp::GuestMemory memory(elf.required_ram_size(load_base));
     (void)elf.load_and_relocate(memory, load_base);
     std::vector<psprecomp::PspImport> imports;
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
@@ -1405,15 +1474,32 @@ std::string lower_constant_vfpu_accesses(std::string text) {
     text = std::regex_replace(text, vscl,
         "ctx.execute_vfpu_vscl_ct<$1u, $2u, $3u, $4u>();");
 
-    const std::regex scalar_read(R"(ctx\.vfpu_scalar_bits\(([0-9]+)u\))");
-    text = std::regex_replace(text, scalar_read,
-        "ctx.vfpu_scalar_bits_ct<$1u>()");
+    // Only real registers can be specialised: there are 128 scalar and 16
+    // control registers, and the compile-time form asserts that. Data decoded as
+    // an MTV can name any of 256, and the runtime form ignores those the way the
+    // hardware does, so leave them as calls rather than failing the build.
+    const auto specialise_scalar = [&text](const std::regex &pattern, const std::string &replacement) {
+        std::string result;
+        auto begin = std::sregex_iterator(text.begin(), text.end(), pattern);
+        std::size_t copied = 0u;
+        for (auto it = begin; it != std::sregex_iterator(); ++it) {
+            const std::smatch &match = *it;
+            const auto position = static_cast<std::size_t>(match.position(0));
+            result.append(text, copied, position - copied);
+            if (std::stoul(match[1].str()) < 144u)
+                result.append(match.format(replacement));
+            else
+                result.append(match.str(0));
+            copied = position + static_cast<std::size_t>(match.length(0));
+        }
+        result.append(text, copied, std::string::npos);
+        text = std::move(result);
+    };
 
+    specialise_scalar(std::regex(R"(ctx\.vfpu_scalar_bits\(([0-9]+)u\))"), "ctx.vfpu_scalar_bits_ct<$1u>()");
     // set_vfpu_scalar_bits second arguments in generated code stay on one line.
-    const std::regex scalar_write(
-        R"(ctx\.set_vfpu_scalar_bits\(([0-9]+)u, ([^;\n]+)\);)" );
-    text = std::regex_replace(text, scalar_write,
-        "ctx.set_vfpu_scalar_bits_ct<$1u>($2);");
+    specialise_scalar(std::regex(R"(ctx\.set_vfpu_scalar_bits\(([0-9]+)u, ([^;\n]+)\);)"),
+                      "ctx.set_vfpu_scalar_bits_ct<$1u>($2);");
     return text;
 }
 
@@ -1435,10 +1521,20 @@ bool write_text_if_changed(const std::filesystem::path &path, const std::string 
 int generate_auto(const std::filesystem::path &elf_path,
                   const std::filesystem::path &output_dir,
                   std::uint32_t load_base,
-                  std::uint32_t unit_span_bytes) {
+                  std::uint32_t unit_span_bytes,
+                  bool chain_units = true) {
+    const auto started = std::chrono::steady_clock::now();
+    // Progress goes to stderr and is flushed per line so `tail -f` on a log
+    // shows how far a long generation has advanced.
+    const auto progress = [&](const std::string &message) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::cerr << "[psp_recomp " << elapsed << "s] " << message << std::endl;
+    };
     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
-    psprecomp::GuestMemory memory;
+    psprecomp::GuestMemory memory(elf.required_ram_size(load_base));
     (void)elf.load_and_relocate(memory, load_base);
+    progress("analyzing executable");
     std::vector<psprecomp::PspImport> imports;
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
     std::set<std::uint32_t> import_stubs;
@@ -1446,20 +1542,21 @@ int generate_auto(const std::filesystem::path &elf_path,
     const auto program = psprecomp::analyze_program(elf, memory, load_base);
     if (program.executable_ranges.empty()) throw psprecomp::Error("ELF has no executable ranges");
 
+    progress("analysis done: " + std::to_string(program.functions.size()) + " functions, " +
+             std::to_string(program.covered_labels.size()) + " instructions");
     std::filesystem::create_directories(output_dir);
     const std::uint32_t executable_base = program.executable_ranges.front().start;
 
-    // Emit every discovered guest instruction once. Function seeds remain analysis
-    // metadata and dispatcher entries, but overlapping CFGs no longer duplicate C++.
-    std::set<std::uint32_t> global_entries = program.covered_entry_labels;
-    for (const auto &[seed, source] : program.seeds) {
-        (void)source;
-        if (program.covered_labels.contains(seed)) global_entries.insert(seed);
+    // Emit every instruction word of the executable sections, and make every one
+    // of them a dispatcher entry. Static analysis cannot resolve every computed
+    // jump (switch tables, virtual calls, overlay trampolines), so control can
+    // arrive at an address the CFG walk never reached; anything not emitted
+    // would stop the runtime. Words that are data decode to a trap instead.
+    std::set<std::uint32_t> emitted_pcs;
+    for (const auto &range : program.executable_ranges) {
+        for (std::uint32_t pc = range.start; pc + 4u <= range.end; pc += 4u) emitted_pcs.insert(pc);
     }
-    for (const auto pc : program.covered_labels) {
-        const std::uint32_t bucket_start = executable_base + ((pc - executable_base) / unit_span_bytes) * unit_span_bytes;
-        if (pc == bucket_start || !program.covered_labels.contains(pc - 4u)) global_entries.insert(pc);
-    }
+    const std::set<std::uint32_t> &global_entries = emitted_pcs;
 
     struct Unit {
         std::uint32_t bucket{};
@@ -1467,7 +1564,7 @@ int generate_auto(const std::filesystem::path &elf_path,
         std::set<std::uint32_t> entries;
     };
     std::map<std::uint32_t, Unit> units_by_bucket;
-    for (const auto pc : program.covered_labels) {
+    for (const auto pc : emitted_pcs) {
         const std::uint32_t bucket = (pc - executable_base) / unit_span_bytes;
         auto &unit = units_by_bucket[bucket];
         unit.bucket = bucket;
@@ -1485,6 +1582,8 @@ int generate_auto(const std::filesystem::path &elf_path,
         (void)bucket;
         if (!unit.entries.empty()) units.push_back(std::move(unit));
     }
+    std::set<std::uint32_t> unit_indices;
+    for (const auto &unit : units) unit_indices.insert(unit.bucket);
 
     // assign the same compact entry ids used by each unit's dense
     // dispatcher globally before emission. Fixed cross-unit edges can pass the
@@ -1498,7 +1597,8 @@ int generate_auto(const std::filesystem::path &elf_path,
     // External declarations let fixed cross-unit edges become native direct
     // calls. Under MSVC /GL + /LTCG the linker can optimize across these TUs
     // instead of forcing every known edge through a function-pointer branch.
-    const auto units_header_path = output_dir / "generated_units.hpp";
+    const std::string units_header_name = g_symbol_prefix + "_units.hpp";
+    const auto units_header_path = output_dir / units_header_name;
     std::ostringstream units_header;
     units_header << "#pragma once\n\n#include <cstdint>\n#include \"psprecomp/guest_memory.hpp\"\n\nnamespace psprecomp {\nclass Runtime;\nstruct AllegrexContext;\n";
     for (const auto &unit : units) {
@@ -1513,7 +1613,9 @@ int generate_auto(const std::filesystem::path &elf_path,
     std::set<std::filesystem::path> expected_cpp;
     std::size_t rewritten_units = 0u;
     std::size_t registered_entries = 0u;
+    std::size_t unit_number = 0u;
     for (const auto &unit : units) {
+        ++unit_number;
         std::ostringstream suffix;
         suffix << std::setfill('0') << std::setw(4) << unit.bucket;
         const std::string suffix_text = suffix.str();
@@ -1521,18 +1623,22 @@ int generate_auto(const std::filesystem::path &elf_path,
         expected_cpp.insert(path.filename());
 
         const GeneratedFunctionInput generated_unit{
-            "recomp_unit_" + suffix_text,
+            generated_unit_cpp_name(unit.bucket),
             executable_base + unit.bucket * unit_span_bytes,
             unit.instructions,
             unit.entries,
             executable_base,
-            unit_span_bytes,
-            &direct_entry_ids,
+            chain_units ? unit_span_bytes : 0u,
+            chain_units ? &direct_entry_ids : nullptr,
             &import_stubs,
+            chain_units ? &unit_indices : nullptr,
         };
 
+        progress("unit " + std::to_string(unit_number) + "/" + std::to_string(units.size()) + " " +
+                 path.filename().string() + ": " + std::to_string(unit.instructions.size()) +
+                 " instructions, " + std::to_string(unit.entries.size()) + " entries");
         std::ostringstream out;
-        out << "#include \"psprecomp/runtime.hpp\"\n#include \"generated_units.hpp\"\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n";
+        out << "#include \"psprecomp/runtime.hpp\"\n#include \"" << units_header_name << "\"\n#include <bit>\n#include <cmath>\n#include <cstdint>\n#include <limits>\n\nnamespace psprecomp {\n";
         // The register-cache lowering passes (per-basic-block GPR/FPR caches and
         // the cross-unit hot-register cache) are deliberately absent.  They kept
         // large numbers of guest registers live in C++ locals and in a second
@@ -1542,33 +1648,50 @@ int generate_auto(const std::filesystem::path &elf_path,
         // each grew past 2 GB, exhausting system memory during a normal build.
         // This pipeline matches the last configuration observed booting on
         // hardware.
-        out << lower_constant_vfpu_accesses(
-                lower_aot_memory_accesses(
-                    lower_constant_fpr_accesses(
-                        lower_constant_gpr_writes(emit_function_source(generated_unit, memory, generated_unit.name)))));
-        out << "void register_generated_unit_" << unit.bucket << "(Runtime &runtime) {\n";
-        out << "    runtime.register_generated_unit(" << unit.bucket << "u, "
-            << psprecomp::hex32(generated_unit.address) << "u, " << unit_span_bytes
-            << "u, &" << generated_unit.name << ", &"
-            << generated_unit_cpp_entry_name(unit.bucket) << ");\n";
+        const std::string unit_label = "unit " + std::to_string(unit_number) + "/" + std::to_string(units.size());
+        std::string source = emit_function_source(generated_unit, memory, generated_unit.name);
+        progress(unit_label + " emitted " + std::to_string(source.size() / 1024u) + " KiB, lowering GPR writes");
+        source = lower_constant_gpr_writes(source);
+        progress(unit_label + " lowering FPR accesses");
+        source = lower_constant_fpr_accesses(source);
+        progress(unit_label + " lowering memory accesses");
+        source = lower_aot_memory_accesses(source);
+        progress(unit_label + " lowering VFPU accesses");
+        out << lower_constant_vfpu_accesses(source);
+        out << "void register_" << g_symbol_prefix << "_unit_" << unit.bucket << "(Runtime &runtime) {\n";
+        // The fast unit table describes one contiguous corpus, so only the main
+        // executable installs itself there; overlay corpora rely on per-address
+        // registration and the generic chain path.
+        if (chain_units) {
+            out << "    runtime.register_generated_unit(" << unit.bucket << "u, "
+                << psprecomp::hex32(generated_unit.address) << "u, " << unit_span_bytes
+                << "u, &" << generated_unit.name << ", &"
+                << generated_unit_cpp_entry_name(unit.bucket) << ");\n";
+        }
         for (const auto label : unit.entries) {
+            // The runtime treats names starting with recomp_unit_ as chainable.
             out << "    runtime.register_function(" << psprecomp::hex32(label) << "u, &"
-                << generated_unit.name << ", \"" << generated_unit.name << "\");\n";
+                << generated_unit.name << ", \"recomp_unit_" << generated_unit.name << "\");\n";
             ++registered_entries;
         }
         out << "}\n} // namespace psprecomp\n";
         rewritten_units += write_text_if_changed(path, out.str()) ? 1u : 0u;
+        progress("unit " + std::to_string(unit_number) + "/" + std::to_string(units.size()) + " written");
     }
 
-    const auto registry_path = output_dir / "generated_registry.cpp";
+    const std::string registry_function =
+        g_symbol_prefix == "recomp" ? "register_generated_functions" : "register_" + g_symbol_prefix + "_functions";
+    const auto registry_path = output_dir / (g_symbol_prefix == "recomp" ? "generated_registry.cpp"
+                                                                        : g_symbol_prefix + "_registry.cpp");
     expected_cpp.insert(registry_path.filename());
     std::ostringstream registry;
     registry << "#include \"psprecomp/runtime.hpp\"\n#include <cstdint>\n\nnamespace psprecomp {\n";
-    for (const auto &unit : units) registry << "void register_generated_unit_" << unit.bucket << "(Runtime &runtime);\n";
+    for (const auto &unit : units)
+        registry << "void register_" << g_symbol_prefix << "_unit_" << unit.bucket << "(Runtime &runtime);\n";
     registry << "\n";
     write_import_wrappers(registry, imports);
-    registry << "void register_generated_functions(Runtime &runtime) {\n";
-    for (const auto &unit : units) registry << "    register_generated_unit_" << unit.bucket << "(runtime);\n";
+    registry << "void " << registry_function << "(Runtime &runtime) {\n";
+    for (const auto &unit : units) registry << "    register_" << g_symbol_prefix << "_unit_" << unit.bucket << "(runtime);\n";
     for (std::size_t i = 0; i < imports.size(); ++i) {
         registry << "    runtime.register_function(" << psprecomp::hex32(imports[i].stub_address)
                  << "u, &import_" << i << ", \"" << cpp_escape(imports[i].library)
@@ -1615,23 +1738,36 @@ int generate_auto(const std::filesystem::path &elf_path,
 int main(int argc, char **argv) {
     try {
         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
-            if (argc > 6) {
-                std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
+            std::vector<std::string> positional;
+            for (int i = 4; i < argc; ++i) {
+                const std::string_view option(argv[i]);
+                // A prefixed corpus (an overlay) gets its own symbol names and
+                // stays out of the main executable's fast unit table.
+                if (option == "--prefix" && i + 1 < argc) {
+                    g_symbol_prefix = argv[++i];
+                    continue;
+                }
+                positional.emplace_back(option);
+            }
+            const std::uint32_t load_base = !positional.empty()
+                ? static_cast<std::uint32_t>(std::stoul(positional[0], nullptr, 0))
+                : psprecomp::kDefaultPspUserLoadBase;
+            const std::uint32_t unit_span = positional.size() > 1u
+                ? static_cast<std::uint32_t>(std::stoul(positional[1], nullptr, 0))
+                : 0x4000u;
+            if (positional.size() > 2u) {
+                std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
+                          << " [--prefix <symbol_prefix>]\n";
                 return 2;
             }
-            const std::uint32_t load_base = argc >= 5
-                ? static_cast<std::uint32_t>(std::stoul(argv[4], nullptr, 0))
-                : psprecomp::kDefaultPspUserLoadBase;
-            const std::uint32_t unit_span = argc >= 6
-                ? static_cast<std::uint32_t>(std::stoul(argv[5], nullptr, 0))
-                : 0x20000u;
             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
-            return generate_auto(argv[1], argv[3], load_base, unit_span);
+            return generate_auto(argv[1], argv[3], load_base, unit_span, g_symbol_prefix == "recomp");
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
         std::cerr << "Usage:\n"
                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
-                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
+                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
+                  << " [--prefix <symbol_prefix>]\n";
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";

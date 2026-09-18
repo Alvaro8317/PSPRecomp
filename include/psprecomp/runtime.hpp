@@ -13,21 +13,31 @@
 #include <unordered_map>
 #include <vector>
 
+// Code compiled into a separate module that the host loads at run time - a
+// recompiled overlay library - reaches the fast-path globals below through the
+// inline chain helpers. A Windows import library only satisfies a data symbol
+// when the reference is decorated, so such a module defines this macro.
+#if defined(_WIN32) && defined(PSPRECOMP_IMPORT_HOST_SYMBOLS)
+#define PSPRECOMP_HOST_DATA __declspec(dllimport)
+#else
+#define PSPRECOMP_HOST_DATA
+#endif
+
 namespace psprecomp {
 
 // generated direct-unit chaining stays on a zero-observer fast path.
 // Diagnostics flip this once for the process and transparently fall back to the
 // fully instrumented runtime lookup. Keeping this as a plain process-global bool
 // makes the common branch one predictable load instead of a hook/table walk.
-extern bool g_runtime_chain_observers_active;
+PSPRECOMP_HOST_DATA extern bool g_runtime_chain_observers_active;
 // Fast-path copy of the scheduler cadence. It is configured before guest
 // execution and lets compile-time direct AOT chains charge ordinary work
 // without calling an out-of-line helper on every cross-unit edge.
-extern std::uint64_t g_runtime_starvation_interval_fast;
+PSPRECOMP_HOST_DATA extern std::uint64_t g_runtime_starvation_interval_fast;
 // Same idea for the thread-switch generation used by every compile-time direct
 // chain. Keeping it as a public fast-path scalar avoids two out-of-line accessor
 // calls per chain when the compiler cannot see through a giant generated unit.
-extern std::uint64_t g_runtime_thread_switch_generation_fast;
+PSPRECOMP_HOST_DATA extern std::uint64_t g_runtime_thread_switch_generation_fast;
 
 #if defined(_MSC_VER)
 #define PSPRECOMP_RUNTIME_FORCEINLINE __forceinline
@@ -110,6 +120,9 @@ public:
     // Profiles may register native replacements for selected guest functions.
     // Generated profile code can call this API without putting game-specific
     // addresses or implementations in the reusable runtime.
+    // Removes every registration in [start, end). A profile calls this before
+    // installing a different overlay into the same guest address window.
+    void unregister_functions(std::uint32_t start, std::uint32_t end);
     void register_native_fast_path(std::uint32_t address, NativeFastPath function);
     void invoke_native_fast_path(std::uint32_t address, AllegrexContext &ctx);
 
@@ -281,6 +294,11 @@ private:
     // direct-chain fast path. Keeping hook/context-token work here leaves the
     // other ~4095 boundaries as a counter increment + predictable compare.
     [[nodiscard]] bool run_starvation_boundary(AllegrexContext &ctx);
+    // Last resort when no function is registered at ctx.pc and the missing
+    // function hook did not resolve it: interpret the guest code instead of
+    // stopping. Returns false when the interpreter is disabled or the address
+    // holds nothing executable, and the caller keeps its own diagnostic.
+    [[nodiscard]] bool run_interpreter_fallback(AllegrexContext &ctx);
 
     GuestMemory memory_;
     NidRegistry nids_;
@@ -353,6 +371,19 @@ void register_generated_functions(Runtime &runtime);
 // dispatch loop roughly every `interval` outer dispatches so a presentation
 // layer can stay informative during long synchronous guest phases.  Passing a
 // null hook or a zero interval disables it and restores the previous loop.
+// Called when outer dispatch finds no function at `pc`. A profile can use it to
+// install code that only exists at run time (a loaded overlay) and return true
+// to have the dispatch retried; returning false stops the runtime as before.
+using RuntimeMissingFunctionHook = bool (*)(Runtime &, AllegrexContext &, std::uint32_t pc);
+void set_runtime_missing_function_hook(RuntimeMissingFunctionHook hook) noexcept;
+
+// Called when generated code reaches an instruction it cannot execute. A profile
+// that can make the address valid again - for instance because the code at that
+// guest address was replaced by an overlay - returns true and execution retries
+// there; returning false stops the runtime with the usual diagnostics.
+using RuntimeUnsupportedHook = bool (*)(Runtime &, AllegrexContext &, std::uint32_t pc, std::uint32_t instruction);
+void set_runtime_unsupported_hook(RuntimeUnsupportedHook hook) noexcept;
+
 using RuntimeHeartbeatHook = void (*)(std::uint64_t dispatch, std::uint32_t pc);
 void set_runtime_heartbeat_hook(RuntimeHeartbeatHook hook, std::uint64_t interval) noexcept;
 

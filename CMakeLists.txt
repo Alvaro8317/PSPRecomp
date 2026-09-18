@@ -78,6 +78,7 @@ add_library(psprecomp_core STATIC
     src/deflate.cpp
     src/elf32.cpp
     src/guest_memory.cpp
+    src/interpreter.cpp
     src/nid_registry.cpp
     src/program_analysis.cpp
     src/runtime.cpp
@@ -95,6 +96,8 @@ endif()
 
 add_executable(psp_analyze tools/analyzer_main.cpp)
 target_link_libraries(psp_analyze PRIVATE psprecomp_core)
+target_compile_definitions(psp_analyze PRIVATE
+    PSPRECOMP_DEFAULT_NIDS_CSV="${CMAKE_CURRENT_SOURCE_DIR}/configs/nids.csv")
 
 add_executable(psp_recomp tools/codegen_main.cpp)
 target_link_libraries(psp_recomp PRIVATE psprecomp_core)

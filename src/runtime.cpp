@@ -1,5 +1,6 @@
 #include "psprecomp/runtime.hpp"
 #include "psprecomp/common.hpp"
+#include "psprecomp/interpreter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +29,8 @@ std::uint32_t g_runtime_dispatch_pc = 0u;
 RuntimeHeartbeatHook g_heartbeat_hook = nullptr;
 std::uint64_t g_heartbeat_interval = 0u;
 RuntimeStarvationHook g_starvation_hook = nullptr;
+RuntimeMissingFunctionHook g_missing_function_hook = nullptr;
+RuntimeUnsupportedHook g_unsupported_hook = nullptr;
 std::uint64_t g_starvation_interval = 0u;
 RuntimePreDispatchHook g_pre_dispatch_hook = nullptr;
 RuntimePostDispatchHook g_post_dispatch_hook = nullptr;
@@ -86,6 +89,12 @@ void report_counted_pcs() {
 void set_runtime_heartbeat_hook(RuntimeHeartbeatHook hook, std::uint64_t interval) noexcept {
     g_heartbeat_hook = interval != 0u ? hook : nullptr;
     g_heartbeat_interval = interval;
+}
+
+void set_runtime_unsupported_hook(RuntimeUnsupportedHook hook) noexcept { g_unsupported_hook = hook; }
+
+void set_runtime_missing_function_hook(RuntimeMissingFunctionHook hook) noexcept {
+    g_missing_function_hook = hook;
 }
 
 void set_runtime_starvation_hook(RuntimeStarvationHook hook, std::uint64_t interval) noexcept {
@@ -192,6 +201,13 @@ bool Runtime::run_starvation_boundary(AllegrexContext &ctx) {
     const bool same_context = runtime_execution_context_matches(before);
     if (!same_context) chain_context_invalidated_ = true;
     return same_context;
+}
+
+bool Runtime::run_interpreter_fallback(AllegrexContext &ctx) {
+    if (!interpreter_fallback_enabled()) return false;
+    // Each entry is bounded, so a long interpreted stretch still returns to the
+    // dispatcher often enough for the starvation hook to preempt the thread.
+    return interpret_allegrex(*this, ctx) != InterpreterExit::Unreachable;
 }
 
 bool Runtime::account_dispatch_work(AllegrexContext &ctx, bool allow_preemption) {
@@ -579,31 +595,38 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             chain_context_invalidated_ = false;
             const std::int32_t dispatch_thread_uid = g_runtime_thread_uid;
             RecompiledFunction function = lookup_function(before);
+            if (function == nullptr && g_missing_function_hook != nullptr &&
+                g_missing_function_hook(*this, cpu_, before)) {
+                function = lookup_function(before);
+            }
             if (function == nullptr) {
-                stop("No recompiled function registered at " + hex32(before));
-                return;
+                if (!run_interpreter_fallback(cpu_)) {
+                    stop("No recompiled function registered at " + hex32(before));
+                    return;
+                }
+            } else {
+                g_runtime_dispatch_pc = before;
+                count_pc(before);
+                if (g_pre_dispatch_hook != nullptr)
+                    g_pre_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
+                try {
+                    function(*this, cpu_);
+                } catch (const Error &e) {
+                    const FunctionEntry *function_entry = lookup_entry(before);
+                    const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
+                    std::ostringstream message;
+                    message << e.what() << " while executing " << name
+                            << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
+                            << " (a0=" << hex32(cpu_.gpr[4]) << ", a1=" << hex32(cpu_.gpr[5])
+                            << ", a2=" << hex32(cpu_.gpr[6]) << ", a3=" << hex32(cpu_.gpr[7])
+                            << ", sp=" << hex32(cpu_.gpr[29]) << ", ra=" << hex32(cpu_.gpr[31]) << ")";
+                    append_gpr_dump(message, cpu_);
+                    throw Error(message.str());
+                }
+                cpu_.gpr[0] = 0u;
+                if (!stopped_ && g_post_dispatch_hook != nullptr)
+                    g_post_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
             }
-            g_runtime_dispatch_pc = before;
-            count_pc(before);
-            if (g_pre_dispatch_hook != nullptr)
-                g_pre_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
-            try {
-                function(*this, cpu_);
-            } catch (const Error &e) {
-                const FunctionEntry *function_entry = lookup_entry(before);
-                const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
-                std::ostringstream message;
-                message << e.what() << " while executing " << name
-                        << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
-                        << " (a0=" << hex32(cpu_.gpr[4]) << ", a1=" << hex32(cpu_.gpr[5])
-                        << ", a2=" << hex32(cpu_.gpr[6]) << ", a3=" << hex32(cpu_.gpr[7])
-                        << ", sp=" << hex32(cpu_.gpr[29]) << ", ra=" << hex32(cpu_.gpr[31]) << ")";
-                append_gpr_dump(message, cpu_);
-                throw Error(message.str());
-            }
-            cpu_.gpr[0] = 0u;
-            if (!stopped_ && g_post_dispatch_hook != nullptr)
-                g_post_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
             if (!stopped_) (void)account_dispatch_work(cpu_, true);
             if (!stopped_ && strict_pc_progress && cpu_.pc == before) {
                 const FunctionEntry *function_entry = lookup_entry(before);
@@ -632,6 +655,9 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                       << " count=" << hot[index].second
                       << " name=" << (profile_entry != nullptr ? profile_entry->name : "unknown") << "\n";
         }
+        // Says which guest addresses ran without a recompiled function, so a
+        // profile can see what is worth adding to its corpus.
+        report_interpreter_stats();
         if (!stopped_) stop("Dispatch profile window complete at " + hex32(cpu_.pc));
         return;
     }
@@ -656,32 +682,39 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
             // back to exact per-PC dispatch automatically.
             RecompiledFunction function = lookup_generated_unit(before);
             if (function == nullptr) function = lookup_function(before);
+            if (function == nullptr && g_missing_function_hook != nullptr &&
+                g_missing_function_hook(*this, cpu_, before)) {
+                function = lookup_function(before);
+            }
             if (function == nullptr) {
-                stop("No recompiled function registered at " + hex32(before));
-                break;
+                if (!run_interpreter_fallback(cpu_)) {
+                    stop("No recompiled function registered at " + hex32(before));
+                    break;
+                }
+            } else {
+                g_runtime_dispatch_pc = before;
+                count_pc(before);
+                if (g_pre_dispatch_hook != nullptr)
+                    g_pre_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
+                try {
+                    function(*this, cpu_);
+                } catch (const Error &e) {
+                    const FunctionEntry *function_entry = lookup_entry(before);
+                    const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
+                    std::ostringstream message;
+                    message << e.what() << " while executing " << name
+                            << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
+                            << " (a0=" << hex32(cpu_.gpr[4]) << ", a1=" << hex32(cpu_.gpr[5])
+                            << ", a2=" << hex32(cpu_.gpr[6]) << ", a3=" << hex32(cpu_.gpr[7])
+                            << ", sp=" << hex32(cpu_.gpr[29]) << ", ra=" << hex32(cpu_.gpr[31]) << ")";
+                    append_gpr_dump(message, cpu_);
+                    throw Error(message.str());
+                }
+                // `$zero` is now enforced at every generated/HLE write site. Do not
+                // dirty the context register cache line after every outer dispatch.
+                if (!stopped_ && g_post_dispatch_hook != nullptr)
+                    g_post_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
             }
-            g_runtime_dispatch_pc = before;
-            count_pc(before);
-            if (g_pre_dispatch_hook != nullptr)
-                g_pre_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
-            try {
-                function(*this, cpu_);
-            } catch (const Error &e) {
-                const FunctionEntry *function_entry = lookup_entry(before);
-                const std::string name = function_entry != nullptr ? function_entry->name : "unknown";
-                std::ostringstream message;
-                message << e.what() << " while executing " << name
-                        << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
-                        << " (a0=" << hex32(cpu_.gpr[4]) << ", a1=" << hex32(cpu_.gpr[5])
-                        << ", a2=" << hex32(cpu_.gpr[6]) << ", a3=" << hex32(cpu_.gpr[7])
-                        << ", sp=" << hex32(cpu_.gpr[29]) << ", ra=" << hex32(cpu_.gpr[31]) << ")";
-                append_gpr_dump(message, cpu_);
-                throw Error(message.str());
-            }
-            // `$zero` is now enforced at every generated/HLE write site. Do not
-            // dirty the context register cache line after every outer dispatch.
-            if (!stopped_ && g_post_dispatch_hook != nullptr)
-                g_post_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
             if (progress_every != 0u && executed_dispatches + 1u >= next_progress) {
                 std::cerr << "[progress] dispatch=" << (executed_dispatches + 1u)
                           << " pc=" << hex32(cpu_.pc) << "\n";
@@ -705,6 +738,9 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                       << " total=" << (executed_dispatches + chained_dispatches_)
                       << " pc=" << hex32(cpu_.pc) << "\n";
         }
+        // Says which guest addresses ran without a recompiled function, so a
+        // profile can see what is worth adding to its corpus.
+        report_interpreter_stats();
         if (!stopped_ && max_dispatches != 0u)
             stop("Dispatch limit reached at " + hex32(cpu_.pc));
         return;
@@ -714,177 +750,223 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         const std::uint32_t before = cpu_.pc;
         chain_context_invalidated_ = false;
         RecompiledFunction function = lookup_function(before);
+        if (function == nullptr && g_missing_function_hook != nullptr &&
+            g_missing_function_hook(*this, cpu_, before)) {
+            function = lookup_function(before);
+        }
         const FunctionEntry *function_entry = lookup_entry(before);
         if (function == nullptr) {
-            stop("No recompiled function registered at " + hex32(before));
-            break;
-        }
-        g_runtime_dispatch_pc = before;
-        count_pc(before);
-        DispatchSnapshot current_snapshot{};
-        current_snapshot.pc = before;
-        current_snapshot.a0 = cpu_.gpr[4];
-        current_snapshot.a1 = cpu_.gpr[5];
-        current_snapshot.a2 = cpu_.gpr[6];
-        current_snapshot.a3 = cpu_.gpr[7];
-        current_snapshot.sp = cpu_.gpr[29];
-        current_snapshot.ra = cpu_.gpr[31];
-        current_snapshot.thread_uid = g_runtime_thread_uid;
-        current_snapshot.thread_name = g_runtime_thread_name;
-        recent_dispatches[recent_next] = current_snapshot;
-        recent_next = (recent_next + 1u) % recent_dispatches.size();
-        recent_count = std::min(recent_count + 1u, recent_dispatches.size());
-        if (before == 0x089345B0u && heap_diag) {
-            constexpr std::uint32_t manager = 0x08BC6500u;
-            std::cerr << "[heapdiag] callback entered manager=" << hex32(manager)
-                      << " global=" << hex32(memory_.load32(0x08BADEF8u)) << "\n";
-            for (std::uint32_t offset = 0; offset < 0x140u; offset += 16u) {
-                std::cerr << "[heapdiag] " << hex32(manager + offset);
-                for (std::uint32_t word = 0; word < 16u; word += 4u)
-                    std::cerr << " " << hex32(memory_.load32(manager + offset + word));
-                std::cerr << "\n";
-            }
-            std::uint32_t block = memory_.load32(manager + 8u);
-            for (std::uint32_t index = 0u; block != 0u && index < 64u; ++index) {
-                if (!memory_.contains(block, 16u)) {
-                    std::cerr << "[heapdiag-free] invalid=" << hex32(block) << "\n";
-                    break;
-                }
-                const std::uint32_t size = memory_.load32(block + 0u);
-                const std::uint32_t prev = memory_.load32(block + 8u);
-                const std::uint32_t next = memory_.load32(block + 12u);
-                std::cerr << "[heapdiag-free] index=" << index << " block=" << hex32(block)
-                          << " size=" << hex32(size) << " prev=" << hex32(prev)
-                          << " next=" << hex32(next) << " end=" << hex32(block + size) << "\n";
-                block = next;
-            }
-        }
-        if (request_alloc_diag &&
-            (before == 0x089390ACu || before == 0x08939114u ||
-             before == 0x08939590u || before == 0x089395D4u ||
-             before == 0x0893961Cu || before == 0x089396D8u ||
-             before == 0x089397CCu || before == 0x08956258u)) {
-            const RuntimeExecutionContextToken token = capture_runtime_execution_context();
-            std::uint32_t manager = 0u;
-            if (before == 0x08939590u) manager = cpu_.gpr[4];
-            else if (before == 0x089395D4u || before == 0x0893961Cu ||
-                     before == 0x089396D8u) manager = cpu_.gpr[16];
-            else if ((before == 0x089390ACu || before == 0x08939114u) &&
-                     memory_.contains(cpu_.gpr[28] + 5908u, 4u))
-                manager = memory_.load32(cpu_.gpr[28] + 5908u);
-            else if (before == 0x089397CCu) manager = cpu_.gpr[4];
-            std::cerr << "[reqalloc] pc=" << hex32(before)
-                      << " uid=" << token.thread_uid
-                      << " gen=" << token.switch_generation
-                      << " v0=" << hex32(cpu_.gpr[2])
-                      << " a0=" << hex32(cpu_.gpr[4])
-                      << " a1=" << hex32(cpu_.gpr[5])
-                      << " a2=" << hex32(cpu_.gpr[6])
-                      << " a3=" << hex32(cpu_.gpr[7])
-                      << " t0=" << hex32(cpu_.gpr[8])
-                      << " t1=" << hex32(cpu_.gpr[9])
-                      << " s0=" << hex32(cpu_.gpr[16])
-                      << " s1=" << hex32(cpu_.gpr[17])
-                      << " s2=" << hex32(cpu_.gpr[18])
-                      << " sp=" << hex32(cpu_.gpr[29])
-                      << " ra=" << hex32(cpu_.gpr[31]);
-            if (manager != 0u && memory_.contains(manager + 6912u, 4u)) {
-                const std::uint32_t free_head = memory_.load32(manager + 6900u);
-                const std::uint32_t active_head = memory_.load32(manager + 6908u);
-                std::cerr << " manager=" << hex32(manager)
-                          << " free_head=" << hex32(free_head)
-                          << " active_head=" << hex32(active_head);
-            }
-            std::uint32_t request = 0u;
-            if (before == 0x089397CCu) request = cpu_.gpr[5];
-            else if (before == 0x089396D8u) request = cpu_.gpr[18];
-            else if (before == 0x08956258u || before == 0x08939114u) request = cpu_.gpr[2];
-            if (request != 0u && memory_.contains(request, 52u)) {
-                std::cerr << " req=" << hex32(request)
-                          << " prev=" << hex32(memory_.load32(request + 0u))
-                          << " next=" << hex32(memory_.load32(request + 4u))
-                          << " size=" << memory_.load32(request + 8u)
-                          << " source=" << hex32(memory_.load32(request + 16u))
-                          << " offset=" << memory_.load32(request + 20u)
-                          << " remaining=" << memory_.load32(request + 24u)
-                          << " progressed=" << memory_.load32(request + 28u)
-                          << " callback=" << hex32(memory_.load32(request + 48u));
-            }
-            std::cerr << "\n";
-        }
-        if (world_stream_diag &&
-            (before == 0x08953990u || before == 0x08955134u ||
-             before == 0x08955E7Cu || before == 0x08956258u ||
-             before == 0x089563C0u || before == 0x08956408u ||
-             before == 0x089569C0u || before == 0x089569E0u)) {
-            std::cerr << "[worlddiag] pc=" << hex32(before)
-                      << " uid=" << g_runtime_thread_uid
-                      << " a0=" << hex32(cpu_.gpr[4])
-                      << " a1=" << hex32(cpu_.gpr[5])
-                      << " ra=" << hex32(cpu_.gpr[31]);
-            if (before == 0x089563C0u && memory_.contains(cpu_.gpr[4], 1040u)) {
-                const std::uint32_t manager = cpu_.gpr[4];
-                std::cerr << " req=" << hex32(cpu_.gpr[5])
-                          << " f596=" << hex32(memory_.load32(manager + 596u))
-                          << " f600=" << hex32(memory_.load32(manager + 600u))
-                          << " event=" << memory_.load32(manager + 616u)
-                          << " active=" << hex32(memory_.load32(manager + 628u))
-                          << " mode=" << memory_.load32(manager + 636u)
-                          << " work=" << hex32(memory_.load32(manager + 640u))
-                          << " limit=" << memory_.load32(manager + 648u)
-                          << " stack=" << memory_.load32(manager + 1036u);
-            }
-            std::uint32_t manager = world_stream_manager;
-            if (before == 0x08955E7Cu || before == 0x08956258u) manager = cpu_.gpr[17];
-            else if (before == 0x08956408u) manager = cpu_.gpr[16];
-            else if (before == 0x089563C0u) manager = cpu_.gpr[4];
-            if (manager != 0u && memory_.contains(manager + 628u, 4u)) {
-                std::cerr << " manager=" << hex32(manager)
-                          << " active_before=" << hex32(memory_.load32(manager + 628u))
-                          << " pending_v0=" << hex32(cpu_.gpr[2]);
-            }
-            std::cerr << "\n";
-            if (world_stream_stop_at_callback && before == 0x089563C0u) {
-                stop("World-stream diagnostic stop at callback " + hex32(before));
+            if (!run_interpreter_fallback(cpu_)) {
+                stop("No recompiled function registered at " + hex32(before));
                 break;
             }
-        }
-        if (file_object_diag &&
-            (before == 0x08938F04u || before == 0x08938F7Cu || before == 0x089394A4u ||
-             before == 0x08955DCCu || before == 0x08955DFCu || before == 0x08955E58u ||
-             before == 0x08955E7Cu)) {
-            const std::uint32_t manager =
-                before == 0x08955DCCu ? cpu_.gpr[4] :
-                ((before == 0x08955DFCu || before == 0x08955E58u || before == 0x08955E7Cu) ? cpu_.gpr[17] : 0u);
-            const std::uint32_t object = before == 0x08938F7Cu ? cpu_.gpr[4] :
-                (before == 0x089394A4u ? cpu_.gpr[5] : 0u);
-            const bool seek_pc = before == 0x08938F7Cu || before == 0x089394A4u;
-            bool manager_changed = false;
-            static std::uint32_t previous_manager = 0u;
-            static std::uint32_t previous_file_object = 0xFFFFFFFFu;
-            static std::uint32_t previous_active = 0xFFFFFFFFu;
-            static std::uint32_t previous_mode = 0xFFFFFFFFu;
-            std::uint32_t manager_file_object = 0u;
-            std::uint32_t manager_active = 0u;
-            std::uint32_t manager_mode = 0u;
-            if (manager != 0u && memory_.contains(manager, 652u)) {
-                manager_file_object = memory_.load32(manager + 624u);
-                manager_active = memory_.load32(manager + 628u);
-                manager_mode = memory_.load32(manager + 636u);
-                manager_changed = manager != previous_manager ||
-                    manager_file_object != previous_file_object ||
-                    manager_active != previous_active || manager_mode != previous_mode;
-                previous_manager = manager;
-                previous_file_object = manager_file_object;
-                previous_active = manager_active;
-                previous_mode = manager_mode;
+        } else {
+            g_runtime_dispatch_pc = before;
+            count_pc(before);
+            DispatchSnapshot current_snapshot{};
+            current_snapshot.pc = before;
+            current_snapshot.a0 = cpu_.gpr[4];
+            current_snapshot.a1 = cpu_.gpr[5];
+            current_snapshot.a2 = cpu_.gpr[6];
+            current_snapshot.a3 = cpu_.gpr[7];
+            current_snapshot.sp = cpu_.gpr[29];
+            current_snapshot.ra = cpu_.gpr[31];
+            current_snapshot.thread_uid = g_runtime_thread_uid;
+            current_snapshot.thread_name = g_runtime_thread_name;
+            recent_dispatches[recent_next] = current_snapshot;
+            recent_next = (recent_next + 1u) % recent_dispatches.size();
+            recent_count = std::min(recent_count + 1u, recent_dispatches.size());
+            if (before == 0x089345B0u && heap_diag) {
+                constexpr std::uint32_t manager = 0x08BC6500u;
+                std::cerr << "[heapdiag] callback entered manager=" << hex32(manager)
+                          << " global=" << hex32(memory_.load32(0x08BADEF8u)) << "\n";
+                for (std::uint32_t offset = 0; offset < 0x140u; offset += 16u) {
+                    std::cerr << "[heapdiag] " << hex32(manager + offset);
+                    for (std::uint32_t word = 0; word < 16u; word += 4u)
+                        std::cerr << " " << hex32(memory_.load32(manager + offset + word));
+                    std::cerr << "\n";
+                }
+                std::uint32_t block = memory_.load32(manager + 8u);
+                for (std::uint32_t index = 0u; block != 0u && index < 64u; ++index) {
+                    if (!memory_.contains(block, 16u)) {
+                        std::cerr << "[heapdiag-free] invalid=" << hex32(block) << "\n";
+                        break;
+                    }
+                    const std::uint32_t size = memory_.load32(block + 0u);
+                    const std::uint32_t prev = memory_.load32(block + 8u);
+                    const std::uint32_t next = memory_.load32(block + 12u);
+                    std::cerr << "[heapdiag-free] index=" << index << " block=" << hex32(block)
+                              << " size=" << hex32(size) << " prev=" << hex32(prev)
+                              << " next=" << hex32(next) << " end=" << hex32(block + size) << "\n";
+                    block = next;
+                }
             }
-            const bool should_log = before == 0x08938F04u ||
-                (seek_pc && object == 0u) || manager_changed;
-            if (should_log) {
-                std::cerr << "[fileobj] pc=" << hex32(before)
+            if (request_alloc_diag &&
+                (before == 0x089390ACu || before == 0x08939114u ||
+                 before == 0x08939590u || before == 0x089395D4u ||
+                 before == 0x0893961Cu || before == 0x089396D8u ||
+                 before == 0x089397CCu || before == 0x08956258u)) {
+                const RuntimeExecutionContextToken token = capture_runtime_execution_context();
+                std::uint32_t manager = 0u;
+                if (before == 0x08939590u) manager = cpu_.gpr[4];
+                else if (before == 0x089395D4u || before == 0x0893961Cu ||
+                         before == 0x089396D8u) manager = cpu_.gpr[16];
+                else if ((before == 0x089390ACu || before == 0x08939114u) &&
+                         memory_.contains(cpu_.gpr[28] + 5908u, 4u))
+                    manager = memory_.load32(cpu_.gpr[28] + 5908u);
+                else if (before == 0x089397CCu) manager = cpu_.gpr[4];
+                std::cerr << "[reqalloc] pc=" << hex32(before)
+                          << " uid=" << token.thread_uid
+                          << " gen=" << token.switch_generation
+                          << " v0=" << hex32(cpu_.gpr[2])
+                          << " a0=" << hex32(cpu_.gpr[4])
+                          << " a1=" << hex32(cpu_.gpr[5])
+                          << " a2=" << hex32(cpu_.gpr[6])
+                          << " a3=" << hex32(cpu_.gpr[7])
+                          << " t0=" << hex32(cpu_.gpr[8])
+                          << " t1=" << hex32(cpu_.gpr[9])
+                          << " s0=" << hex32(cpu_.gpr[16])
+                          << " s1=" << hex32(cpu_.gpr[17])
+                          << " s2=" << hex32(cpu_.gpr[18])
+                          << " sp=" << hex32(cpu_.gpr[29])
+                          << " ra=" << hex32(cpu_.gpr[31]);
+                if (manager != 0u && memory_.contains(manager + 6912u, 4u)) {
+                    const std::uint32_t free_head = memory_.load32(manager + 6900u);
+                    const std::uint32_t active_head = memory_.load32(manager + 6908u);
+                    std::cerr << " manager=" << hex32(manager)
+                              << " free_head=" << hex32(free_head)
+                              << " active_head=" << hex32(active_head);
+                }
+                std::uint32_t request = 0u;
+                if (before == 0x089397CCu) request = cpu_.gpr[5];
+                else if (before == 0x089396D8u) request = cpu_.gpr[18];
+                else if (before == 0x08956258u || before == 0x08939114u) request = cpu_.gpr[2];
+                if (request != 0u && memory_.contains(request, 52u)) {
+                    std::cerr << " req=" << hex32(request)
+                              << " prev=" << hex32(memory_.load32(request + 0u))
+                              << " next=" << hex32(memory_.load32(request + 4u))
+                              << " size=" << memory_.load32(request + 8u)
+                              << " source=" << hex32(memory_.load32(request + 16u))
+                              << " offset=" << memory_.load32(request + 20u)
+                              << " remaining=" << memory_.load32(request + 24u)
+                              << " progressed=" << memory_.load32(request + 28u)
+                              << " callback=" << hex32(memory_.load32(request + 48u));
+                }
+                std::cerr << "\n";
+            }
+            if (world_stream_diag &&
+                (before == 0x08953990u || before == 0x08955134u ||
+                 before == 0x08955E7Cu || before == 0x08956258u ||
+                 before == 0x089563C0u || before == 0x08956408u ||
+                 before == 0x089569C0u || before == 0x089569E0u)) {
+                std::cerr << "[worlddiag] pc=" << hex32(before)
                           << " uid=" << g_runtime_thread_uid
-                          << " name=" << g_runtime_thread_name.data()
+                          << " a0=" << hex32(cpu_.gpr[4])
+                          << " a1=" << hex32(cpu_.gpr[5])
+                          << " ra=" << hex32(cpu_.gpr[31]);
+                if (before == 0x089563C0u && memory_.contains(cpu_.gpr[4], 1040u)) {
+                    const std::uint32_t manager = cpu_.gpr[4];
+                    std::cerr << " req=" << hex32(cpu_.gpr[5])
+                              << " f596=" << hex32(memory_.load32(manager + 596u))
+                              << " f600=" << hex32(memory_.load32(manager + 600u))
+                              << " event=" << memory_.load32(manager + 616u)
+                              << " active=" << hex32(memory_.load32(manager + 628u))
+                              << " mode=" << memory_.load32(manager + 636u)
+                              << " work=" << hex32(memory_.load32(manager + 640u))
+                              << " limit=" << memory_.load32(manager + 648u)
+                              << " stack=" << memory_.load32(manager + 1036u);
+                }
+                std::uint32_t manager = world_stream_manager;
+                if (before == 0x08955E7Cu || before == 0x08956258u) manager = cpu_.gpr[17];
+                else if (before == 0x08956408u) manager = cpu_.gpr[16];
+                else if (before == 0x089563C0u) manager = cpu_.gpr[4];
+                if (manager != 0u && memory_.contains(manager + 628u, 4u)) {
+                    std::cerr << " manager=" << hex32(manager)
+                              << " active_before=" << hex32(memory_.load32(manager + 628u))
+                              << " pending_v0=" << hex32(cpu_.gpr[2]);
+                }
+                std::cerr << "\n";
+                if (world_stream_stop_at_callback && before == 0x089563C0u) {
+                    stop("World-stream diagnostic stop at callback " + hex32(before));
+                    break;
+                }
+            }
+            if (file_object_diag &&
+                (before == 0x08938F04u || before == 0x08938F7Cu || before == 0x089394A4u ||
+                 before == 0x08955DCCu || before == 0x08955DFCu || before == 0x08955E58u ||
+                 before == 0x08955E7Cu)) {
+                const std::uint32_t manager =
+                    before == 0x08955DCCu ? cpu_.gpr[4] :
+                    ((before == 0x08955DFCu || before == 0x08955E58u || before == 0x08955E7Cu) ? cpu_.gpr[17] : 0u);
+                const std::uint32_t object = before == 0x08938F7Cu ? cpu_.gpr[4] :
+                    (before == 0x089394A4u ? cpu_.gpr[5] : 0u);
+                const bool seek_pc = before == 0x08938F7Cu || before == 0x089394A4u;
+                bool manager_changed = false;
+                static std::uint32_t previous_manager = 0u;
+                static std::uint32_t previous_file_object = 0xFFFFFFFFu;
+                static std::uint32_t previous_active = 0xFFFFFFFFu;
+                static std::uint32_t previous_mode = 0xFFFFFFFFu;
+                std::uint32_t manager_file_object = 0u;
+                std::uint32_t manager_active = 0u;
+                std::uint32_t manager_mode = 0u;
+                if (manager != 0u && memory_.contains(manager, 652u)) {
+                    manager_file_object = memory_.load32(manager + 624u);
+                    manager_active = memory_.load32(manager + 628u);
+                    manager_mode = memory_.load32(manager + 636u);
+                    manager_changed = manager != previous_manager ||
+                        manager_file_object != previous_file_object ||
+                        manager_active != previous_active || manager_mode != previous_mode;
+                    previous_manager = manager;
+                    previous_file_object = manager_file_object;
+                    previous_active = manager_active;
+                    previous_mode = manager_mode;
+                }
+                const bool should_log = before == 0x08938F04u ||
+                    (seek_pc && object == 0u) || manager_changed;
+                if (should_log) {
+                    std::cerr << "[fileobj] pc=" << hex32(before)
+                              << " uid=" << g_runtime_thread_uid
+                              << " name=" << g_runtime_thread_name.data()
+                              << " v0=" << hex32(cpu_.gpr[2])
+                              << " a0=" << hex32(cpu_.gpr[4])
+                              << " a1=" << hex32(cpu_.gpr[5])
+                              << " a2=" << hex32(cpu_.gpr[6])
+                              << " a3=" << hex32(cpu_.gpr[7])
+                              << " s0=" << hex32(cpu_.gpr[16])
+                              << " s1=" << hex32(cpu_.gpr[17])
+                              << " sp=" << hex32(cpu_.gpr[29])
+                              << " ra=" << hex32(cpu_.gpr[31]);
+                    if (before == 0x08938F04u && memory_.contains(cpu_.gpr[4])) {
+                        try { std::cerr << " path=\"" << memory_.read_c_string(cpu_.gpr[4], 512u) << "\""; } catch (...) {}
+                    }
+                    if (manager != 0u && memory_.contains(manager, 652u)) {
+                        std::cerr << " manager=" << hex32(manager)
+                                  << " f596=" << hex32(memory_.load32(manager + 596u))
+                                  << " f600=" << hex32(memory_.load32(manager + 600u))
+                                  << " event=" << memory_.load32(manager + 616u)
+                                  << " fileobj=" << hex32(manager_file_object)
+                                  << " active=" << hex32(manager_active)
+                                  << " mode=" << manager_mode
+                                  << " work=" << hex32(memory_.load32(manager + 640u))
+                                  << " offset=" << memory_.load32(manager + 644u)
+                                  << " length=" << memory_.load32(manager + 648u);
+                    }
+                    if (object != 0u && memory_.contains(object, 16u)) {
+                        std::cerr << " object=" << hex32(object)
+                                  << " words=" << hex32(memory_.load32(object + 0u))
+                                  << "," << hex32(memory_.load32(object + 4u))
+                                  << "," << hex32(memory_.load32(object + 8u))
+                                  << "," << hex32(memory_.load32(object + 12u));
+                    }
+                    std::cerr << "\n";
+                }
+                if (file_object_stop_on_null && seek_pc && object == 0u) {
+                    stop("File-object diagnostic stop before null seek at " + hex32(before));
+                    break;
+                }
+            }
+            if (trace_pc_enabled && before == trace_pc) {
+                std::cerr << "[trace-pc] " << hex32(before) << " " << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
                           << " v0=" << hex32(cpu_.gpr[2])
                           << " a0=" << hex32(cpu_.gpr[4])
                           << " a1=" << hex32(cpu_.gpr[5])
@@ -892,139 +974,100 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
                           << " a3=" << hex32(cpu_.gpr[7])
                           << " s0=" << hex32(cpu_.gpr[16])
                           << " s1=" << hex32(cpu_.gpr[17])
+                          << " s2=" << hex32(cpu_.gpr[18])
+                          << " s3=" << hex32(cpu_.gpr[19])
                           << " sp=" << hex32(cpu_.gpr[29])
                           << " ra=" << hex32(cpu_.gpr[31]);
-                if (before == 0x08938F04u && memory_.contains(cpu_.gpr[4])) {
-                    try { std::cerr << " path=\"" << memory_.read_c_string(cpu_.gpr[4], 512u) << "\""; } catch (...) {}
+                if (memory_.contains(cpu_.gpr[4])) {
+                    try { std::cerr << " a0str=\"" << memory_.read_c_string(cpu_.gpr[4], 256u) << "\""; } catch (...) {}
                 }
-                if (manager != 0u && memory_.contains(manager, 652u)) {
-                    std::cerr << " manager=" << hex32(manager)
-                              << " f596=" << hex32(memory_.load32(manager + 596u))
-                              << " f600=" << hex32(memory_.load32(manager + 600u))
-                              << " event=" << memory_.load32(manager + 616u)
-                              << " fileobj=" << hex32(manager_file_object)
-                              << " active=" << hex32(manager_active)
-                              << " mode=" << manager_mode
-                              << " work=" << hex32(memory_.load32(manager + 640u))
-                              << " offset=" << memory_.load32(manager + 644u)
-                              << " length=" << memory_.load32(manager + 648u);
+                if (memory_.contains(cpu_.gpr[5])) {
+                    try { std::cerr << " a1str=\"" << memory_.read_c_string(cpu_.gpr[5], 256u) << "\""; } catch (...) {}
                 }
-                if (object != 0u && memory_.contains(object, 16u)) {
-                    std::cerr << " object=" << hex32(object)
-                              << " words=" << hex32(memory_.load32(object + 0u))
-                              << "," << hex32(memory_.load32(object + 4u))
-                              << "," << hex32(memory_.load32(object + 8u))
-                              << "," << hex32(memory_.load32(object + 12u));
+                if (std::getenv("PSPRECOMP_TRACE_MEM") != nullptr) {
+                    for (const auto &[label, address] : std::array<std::pair<const char *, std::uint32_t>, 2>{{{"a0mem", cpu_.gpr[4]}, {"a1mem", cpu_.gpr[5]}}}) {
+                        if (!memory_.contains(address, 32u)) continue;
+                        std::cerr << " " << label << "=";
+                        for (std::uint32_t offset = 0; offset < 32u; offset += 4u)
+                            std::cerr << (offset == 0u ? "" : ",") << hex32(memory_.load32(address + offset));
+                    }
                 }
                 std::cerr << "\n";
             }
-            if (file_object_stop_on_null && seek_pc && object == 0u) {
-                stop("File-object diagnostic stop before null seek at " + hex32(before));
-                break;
+            if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
+                std::cerr << "[dispatch] " << hex32(before) << " " << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
+                          << " a0=" << hex32(cpu_.gpr[4])
+                          << " a1=" << hex32(cpu_.gpr[5])
+                          << " a2=" << hex32(cpu_.gpr[6])
+                          << " a3=" << hex32(cpu_.gpr[7])
+                          << " sp=" << hex32(cpu_.gpr[29])
+                          << " ra=" << hex32(cpu_.gpr[31]) << "\n";
             }
-        }
-        if (trace_pc_enabled && before == trace_pc) {
-            std::cerr << "[trace-pc] " << hex32(before) << " " << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
-                      << " v0=" << hex32(cpu_.gpr[2])
-                      << " a0=" << hex32(cpu_.gpr[4])
-                      << " a1=" << hex32(cpu_.gpr[5])
-                      << " a2=" << hex32(cpu_.gpr[6])
-                      << " a3=" << hex32(cpu_.gpr[7])
-                      << " s0=" << hex32(cpu_.gpr[16])
-                      << " s1=" << hex32(cpu_.gpr[17])
-                      << " s2=" << hex32(cpu_.gpr[18])
-                      << " s3=" << hex32(cpu_.gpr[19])
-                      << " sp=" << hex32(cpu_.gpr[29])
-                      << " ra=" << hex32(cpu_.gpr[31]);
-            if (memory_.contains(cpu_.gpr[4])) {
-                try { std::cerr << " a0str=\"" << memory_.read_c_string(cpu_.gpr[4], 256u) << "\""; } catch (...) {}
+            try {
+                function(*this, cpu_);
+            } catch (const Error &e) {
+                if (trace_on_error) {
+                    std::cerr << "[recent-dispatches] oldest-to-newest count=" << recent_count << "\n";
+                    const std::size_t first = (recent_next + recent_dispatches.size() - recent_count) % recent_dispatches.size();
+                    for (std::size_t index = 0; index < recent_count; ++index) {
+                        const DispatchSnapshot &snapshot = recent_dispatches[(first + index) % recent_dispatches.size()];
+                        std::cerr << "[recent] uid=" << snapshot.thread_uid
+                                  << " name=" << snapshot.thread_name.data()
+                                  << " pc=" << hex32(snapshot.pc)
+                                  << " a0=" << hex32(snapshot.a0)
+                                  << " a1=" << hex32(snapshot.a1)
+                                  << " a2=" << hex32(snapshot.a2)
+                                  << " a3=" << hex32(snapshot.a3)
+                                  << " sp=" << hex32(snapshot.sp)
+                                  << " ra=" << hex32(snapshot.ra) << "\n";
+                    }
+                }
+                std::ostringstream message;
+                message << e.what() << " while executing " << (function_entry != nullptr ? function_entry->name : std::string("unknown")) << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
+                        << " (a0=" << hex32(cpu_.gpr[4]) << ", a1=" << hex32(cpu_.gpr[5])
+                        << ", a2=" << hex32(cpu_.gpr[6]) << ", a3=" << hex32(cpu_.gpr[7])
+                        << ", sp=" << hex32(cpu_.gpr[29]) << ", ra=" << hex32(cpu_.gpr[31]) << ")";
+                append_gpr_dump(message, cpu_);
+                throw Error(message.str());
             }
-            if (memory_.contains(cpu_.gpr[5])) {
-                try { std::cerr << " a1str=\"" << memory_.read_c_string(cpu_.gpr[5], 256u) << "\""; } catch (...) {}
-            }
-            if (std::getenv("PSPRECOMP_TRACE_MEM") != nullptr) {
-                for (const auto &[label, address] : std::array<std::pair<const char *, std::uint32_t>, 2>{{{"a0mem", cpu_.gpr[4]}, {"a1mem", cpu_.gpr[5]}}}) {
-                    if (!memory_.contains(address, 32u)) continue;
-                    std::cerr << " " << label << "=";
-                    for (std::uint32_t offset = 0; offset < 32u; offset += 4u)
-                        std::cerr << (offset == 0u ? "" : ",") << hex32(memory_.load32(address + offset));
+            cpu_.gpr[0] = 0u;
+            if (world_stream_diag && world_stream_manager != 0u &&
+                memory_.contains(world_stream_manager + 628u, 4u)) {
+                const std::uint32_t active = memory_.load32(world_stream_manager + 628u);
+                if (!world_stream_active_known) {
+                    world_stream_previous_active = active;
+                    world_stream_active_known = true;
+                } else if (active != world_stream_previous_active) {
+                    std::cerr << "[worlddiag-transition] dispatch_pc=" << hex32(before)
+                              << " uid_before=" << current_snapshot.thread_uid
+                              << " uid_after=" << g_runtime_thread_uid
+                              << " manager=" << hex32(world_stream_manager)
+                              << " active=" << hex32(world_stream_previous_active)
+                              << "->" << hex32(active)
+                              << " next_pc=" << hex32(cpu_.pc);
+                    if (active != 0u && memory_.contains(active, 52u)) {
+                        std::cerr << " source=" << hex32(memory_.load32(active + 16u))
+                                  << " offset=" << memory_.load32(active + 20u)
+                                  << " remaining=" << memory_.load32(active + 24u)
+                                  << " progressed=" << memory_.load32(active + 28u)
+                                  << " callback=" << hex32(memory_.load32(active + 48u));
+                    }
+                    std::cerr << "\n";
+                    world_stream_previous_active = active;
+                }
+                if (before == 0x08955E7Cu || before == 0x08956258u ||
+                    before == 0x08956408u || before == 0x089563C0u) {
+                    std::cerr << "[worlddiag-after] dispatch_pc=" << hex32(before)
+                              << " uid_before=" << current_snapshot.thread_uid
+                              << " uid_after=" << g_runtime_thread_uid
+                              << " manager=" << hex32(world_stream_manager)
+                              << " active_after=" << hex32(active)
+                              << " next_pc=" << hex32(cpu_.pc) << "\n";
                 }
             }
-            std::cerr << "\n";
+            if (!stopped_ && g_post_dispatch_hook != nullptr)
+                g_post_dispatch_hook(*this, cpu_, before, current_snapshot.thread_uid);
         }
-        if (std::getenv("PSPRECOMP_TRACE") != nullptr) {
-            std::cerr << "[dispatch] " << hex32(before) << " " << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
-                      << " a0=" << hex32(cpu_.gpr[4])
-                      << " a1=" << hex32(cpu_.gpr[5])
-                      << " a2=" << hex32(cpu_.gpr[6])
-                      << " a3=" << hex32(cpu_.gpr[7])
-                      << " sp=" << hex32(cpu_.gpr[29])
-                      << " ra=" << hex32(cpu_.gpr[31]) << "\n";
-        }
-        try {
-            function(*this, cpu_);
-        } catch (const Error &e) {
-            if (trace_on_error) {
-                std::cerr << "[recent-dispatches] oldest-to-newest count=" << recent_count << "\n";
-                const std::size_t first = (recent_next + recent_dispatches.size() - recent_count) % recent_dispatches.size();
-                for (std::size_t index = 0; index < recent_count; ++index) {
-                    const DispatchSnapshot &snapshot = recent_dispatches[(first + index) % recent_dispatches.size()];
-                    std::cerr << "[recent] uid=" << snapshot.thread_uid
-                              << " name=" << snapshot.thread_name.data()
-                              << " pc=" << hex32(snapshot.pc)
-                              << " a0=" << hex32(snapshot.a0)
-                              << " a1=" << hex32(snapshot.a1)
-                              << " a2=" << hex32(snapshot.a2)
-                              << " a3=" << hex32(snapshot.a3)
-                              << " sp=" << hex32(snapshot.sp)
-                              << " ra=" << hex32(snapshot.ra) << "\n";
-                }
-            }
-            std::ostringstream message;
-            message << e.what() << " while executing " << (function_entry != nullptr ? function_entry->name : std::string("unknown")) << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc)
-                    << " (a0=" << hex32(cpu_.gpr[4]) << ", a1=" << hex32(cpu_.gpr[5])
-                    << ", a2=" << hex32(cpu_.gpr[6]) << ", a3=" << hex32(cpu_.gpr[7])
-                    << ", sp=" << hex32(cpu_.gpr[29]) << ", ra=" << hex32(cpu_.gpr[31]) << ")";
-            append_gpr_dump(message, cpu_);
-            throw Error(message.str());
-        }
-        cpu_.gpr[0] = 0u;
-        if (world_stream_diag && world_stream_manager != 0u &&
-            memory_.contains(world_stream_manager + 628u, 4u)) {
-            const std::uint32_t active = memory_.load32(world_stream_manager + 628u);
-            if (!world_stream_active_known) {
-                world_stream_previous_active = active;
-                world_stream_active_known = true;
-            } else if (active != world_stream_previous_active) {
-                std::cerr << "[worlddiag-transition] dispatch_pc=" << hex32(before)
-                          << " uid_before=" << current_snapshot.thread_uid
-                          << " uid_after=" << g_runtime_thread_uid
-                          << " manager=" << hex32(world_stream_manager)
-                          << " active=" << hex32(world_stream_previous_active)
-                          << "->" << hex32(active)
-                          << " next_pc=" << hex32(cpu_.pc);
-                if (active != 0u && memory_.contains(active, 52u)) {
-                    std::cerr << " source=" << hex32(memory_.load32(active + 16u))
-                              << " offset=" << memory_.load32(active + 20u)
-                              << " remaining=" << memory_.load32(active + 24u)
-                              << " progressed=" << memory_.load32(active + 28u)
-                              << " callback=" << hex32(memory_.load32(active + 48u));
-                }
-                std::cerr << "\n";
-                world_stream_previous_active = active;
-            }
-            if (before == 0x08955E7Cu || before == 0x08956258u ||
-                before == 0x08956408u || before == 0x089563C0u) {
-                std::cerr << "[worlddiag-after] dispatch_pc=" << hex32(before)
-                          << " uid_before=" << current_snapshot.thread_uid
-                          << " uid_after=" << g_runtime_thread_uid
-                          << " manager=" << hex32(world_stream_manager)
-                          << " active_after=" << hex32(active)
-                          << " next_pc=" << hex32(cpu_.pc) << "\n";
-            }
-        }
-        if (!stopped_ && g_post_dispatch_hook != nullptr)
-            g_post_dispatch_hook(*this, cpu_, before, current_snapshot.thread_uid);
         // Starvation preemption must behave identically under diagnostics, or a
         // traced run would stall where a production run makes progress.
         if (g_starvation_hook != nullptr && g_starvation_interval != 0u)
@@ -1088,6 +1131,9 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
         }
         stop("Dispatch limit reached at " + hex32(cpu_.pc));
     }
+    // Says which guest addresses ran without a recompiled function, so a
+    // profile can see what is worth adding to its corpus.
+    report_interpreter_stats();
 }
 
 void Runtime::stop(std::string reason) { stopped_ = true; stop_reason_ = std::move(reason); }
@@ -1095,11 +1141,35 @@ bool Runtime::stopped() const noexcept { return stopped_; }
 const std::string &Runtime::stop_reason() const noexcept { return stop_reason_; }
 
 void Runtime::unsupported(std::uint32_t pc, std::uint32_t instruction, const std::string &reason) {
+    // Overlaid code can make a previously generated address invalid. Give the
+    // profile a chance to replace it and resume at the same guest PC.
+    if (g_unsupported_hook != nullptr && g_unsupported_hook(*this, cpu_, pc, instruction)) {
+        cpu_.pc = pc;
+        return;
+    }
     stop("Unsupported Allegrex instruction " + hex32(instruction) + " at " + hex32(pc) + ": " + reason);
 }
 
 void Runtime::arithmetic_overflow(std::uint32_t pc, std::uint32_t instruction) {
     stop("Allegrex arithmetic overflow for " + hex32(instruction) + " at " + hex32(pc));
+}
+
+void Runtime::unregister_functions(std::uint32_t start, std::uint32_t end) {
+    for (auto it = functions_.begin(); it != functions_.end();) {
+        if (it->first < start || it->first >= end) {
+            ++it;
+            continue;
+        }
+        const std::uint32_t c = memory_.canonical(it->first);
+        if (c >= direct_base_) {
+            const std::size_t index = static_cast<std::size_t>(c - direct_base_) / 4u;
+            if (index < direct_functions_.size()) {
+                direct_functions_[index] = nullptr;
+                direct_chainable_[index] = nullptr;
+            }
+        }
+        it = functions_.erase(it);
+    }
 }
 
 void Runtime::register_native_fast_path(std::uint32_t address, NativeFastPath function) {

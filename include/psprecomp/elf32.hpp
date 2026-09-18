@@ -95,6 +95,11 @@ public:
     [[nodiscard]] std::uint32_t section_runtime_address(const ElfSection &section,
                                                         std::uint32_t load_base = kDefaultPspUserLoadBase) const noexcept;
 
+    // Smallest supported guest RAM (32 or 64 MiB) that holds every PT_LOAD
+    // segment including its BSS. Extended-memory titles such as PS3 PSP
+    // remasters place BSS past the classic 0x0A000000 user RAM limit.
+    [[nodiscard]] std::uint32_t required_ram_size(std::uint32_t load_base = kDefaultPspUserLoadBase) const;
+
     void load_into(GuestMemory &memory, std::uint32_t load_base = kDefaultPspUserLoadBase) const;
     [[nodiscard]] RelocationStats apply_relocations(GuestMemory &memory,
                                                     std::uint32_t load_base = kDefaultPspUserLoadBase) const;

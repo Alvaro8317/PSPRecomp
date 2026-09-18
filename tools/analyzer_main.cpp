@@ -4,6 +4,7 @@
 #include "psprecomp/program_analysis.hpp"
 #include "psprecomp/sha256.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -82,10 +83,15 @@ int main(int argc, char **argv) {
         if (argc == 4) load_base = static_cast<std::uint32_t>(std::stoul(argv[3], nullptr, 0));
 
         auto elf = psprecomp::Elf32Image::from_file(input);
-        psprecomp::GuestMemory memory(32u * 1024u * 1024u);
+        psprecomp::GuestMemory memory(elf.required_ram_size(load_base));
         const auto relocations = elf.load_and_relocate(memory, load_base);
         const auto module = elf.find_module_info(memory, load_base);
         psprecomp::NidRegistry nids;
+        const char *nids_csv = std::getenv("PSPRECOMP_NIDS_CSV");
+#if defined(PSPRECOMP_DEFAULT_NIDS_CSV)
+        if (nids_csv == nullptr) nids_csv = PSPRECOMP_DEFAULT_NIDS_CSV;
+#endif
+        if (nids_csv != nullptr && std::filesystem::is_regular_file(nids_csv)) nids.load_csv(nids_csv);
         std::vector<psprecomp::PspImport> imports;
         if (module) imports = elf.scan_imports(memory, *module);
         const auto program = psprecomp::analyze_program(elf, memory, load_base);
@@ -179,6 +185,7 @@ int main(int argc, char **argv) {
             << "}\n";
 
         std::cout << "Analyzed " << input.string() << "\n"
+                  << "  guest RAM:           " << (memory.size() / (1024u * 1024u)) << " MiB\n"
                   << "  runtime entry:       " << psprecomp::hex32(elf.runtime_entry(load_base)) << "\n"
                   << "  relocations:         " << relocations.total << " (invalid " << relocations.invalid
                   << ", unsupported " << relocations.unsupported << ")\n"

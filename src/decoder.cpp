@@ -67,6 +67,7 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
         case 0x0A: d.kind = OpcodeKind::Movz; d.mnemonic = "movz"; break;
         case 0x0B: d.kind = OpcodeKind::Movn; d.mnemonic = "movn"; break;
         case 0x0C: d.kind = OpcodeKind::Syscall; d.mnemonic = "syscall"; break;
+        case 0x0D: d.kind = OpcodeKind::Break; d.mnemonic = "break"; break;
         case 0x0F: d.kind = OpcodeKind::Sync; d.mnemonic = "sync"; break;
         case 0x10: d.kind = OpcodeKind::Mfhi; d.mnemonic = "mfhi"; break;
         case 0x11: d.kind = OpcodeKind::Mthi; d.mnemonic = "mthi"; break;
@@ -78,6 +79,8 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
         case 0x19: d.kind = OpcodeKind::Multu; d.mnemonic = "multu"; break;
         case 0x1A: d.kind = OpcodeKind::Div; d.mnemonic = "div"; break;
         case 0x1B: d.kind = OpcodeKind::Divu; d.mnemonic = "divu"; break;
+        case 0x1C: d.kind = OpcodeKind::Madd; d.mnemonic = "madd"; break;
+        case 0x1D: d.kind = OpcodeKind::Maddu; d.mnemonic = "maddu"; break;
         case 0x20: d.kind = OpcodeKind::Add; d.mnemonic = "add"; break;
         case 0x21: d.kind = OpcodeKind::Addu; d.mnemonic = "addu"; break;
         case 0x22: d.kind = OpcodeKind::Sub; d.mnemonic = "sub"; break;
@@ -90,6 +93,8 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
         case 0x2B: d.kind = OpcodeKind::Sltu; d.mnemonic = "sltu"; break;
         case 0x2C: d.kind = OpcodeKind::Max; d.mnemonic = "max"; break;
         case 0x2D: d.kind = OpcodeKind::Min; d.mnemonic = "min"; break;
+        case 0x2E: d.kind = OpcodeKind::Msub; d.mnemonic = "msub"; break;
+        case 0x2F: d.kind = OpcodeKind::Msubu; d.mnemonic = "msubu"; break;
         default: d.kind = OpcodeKind::Unsupported; d.mnemonic = "special?"; break;
         }
         break;
@@ -322,6 +327,12 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
         } else if (group == 2u && operation == 4u) {
             d.kind = OpcodeKind::Vocp;
             d.mnemonic = "vocp";
+        } else if (group == 2u && operation == 5u) {
+            d.kind = OpcodeKind::Vsocp;
+            d.mnemonic = "vsocp";
+        } else if (group == 2u && operation == 10u) {
+            d.kind = OpcodeKind::Vsgn;
+            d.mnemonic = "vsgn";
         } else if (group == 2u && (operation == 6u || operation == 7u)) {
             d.kind = OpcodeKind::VfpuHorizontal;
             d.mnemonic = operation == 6u ? "vfad" : "vavg";
