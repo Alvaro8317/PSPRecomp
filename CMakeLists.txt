@@ -6,6 +6,40 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# A compiler cache turns a lost .ninja_deps, a clean or a regenerated corpus
+# into seconds of cache hits instead of a full rebuild of the generated units.
+option(PSPRECOMP_CCACHE "Compile through ccache when it is installed" ON)
+if(PSPRECOMP_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(PSPRECOMP_CCACHE_PROGRAM ccache)
+    if(PSPRECOMP_CCACHE_PROGRAM)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${PSPRECOMP_CCACHE_PROGRAM}")
+        # Hash paths inside the checkout relative to it, so checkouts at other
+        # paths share cache entries (ccache 4.8+ reads settings given this way).
+        execute_process(COMMAND "${PSPRECOMP_CCACHE_PROGRAM}" --version
+            OUTPUT_VARIABLE _psprecomp_ccache_version ERROR_QUIET)
+        if(_psprecomp_ccache_version MATCHES "version ([0-9]+\\.[0-9]+)"
+           AND CMAKE_MATCH_1 VERSION_GREATER_EQUAL "4.8")
+            list(APPEND CMAKE_CXX_COMPILER_LAUNCHER "base_dir=${PROJECT_SOURCE_DIR}")
+        endif()
+        message(STATUS "Compiling through ${PSPRECOMP_CCACHE_PROGRAM}")
+    endif()
+endif()
+
+# Each generated AOT unit takes well over a gigabyte to compile. Ninja runs the
+# compiles of targets in this pool at most this many at a time, whatever -j
+# the build was started with. The default allows one per 4 GiB of memory.
+cmake_host_system_information(RESULT _psprecomp_memory_mib QUERY TOTAL_PHYSICAL_MEMORY)
+math(EXPR _psprecomp_default_jobs "${_psprecomp_memory_mib} / 4096")
+if(_psprecomp_default_jobs LESS 1)
+    set(_psprecomp_default_jobs 1)
+endif()
+set(PSPRECOMP_GENERATED_JOBS "${_psprecomp_default_jobs}" CACHE STRING
+    "Maximum concurrent compiles of generated AOT code (Ninja generators only)")
+if(NOT PSPRECOMP_GENERATED_JOBS MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "PSPRECOMP_GENERATED_JOBS must be a positive integer")
+endif()
+set_property(GLOBAL APPEND PROPERTY JOB_POOLS psprecomp_generated=${PSPRECOMP_GENERATED_JOBS})
+
 option(PSPRECOMP_BUILD_TESTS "Build reusable PSPRecomp tests" ON)
 option(PSPRECOMP_BUILD_PROFILE_TESTS "Build tests supplied by the selected profile" ON)
 set(PSPRECOMP_PROFILE "" CACHE STRING "Profile to build from profiles/<name>; empty builds only the framework")
@@ -131,4 +165,35 @@ if(NOT PSPRECOMP_PROFILE STREQUAL "")
         message(FATAL_ERROR "Unknown PSPRecomp profile: ${PSPRECOMP_PROFILE}")
     endif()
     add_subdirectory("${PSPRECOMP_PROFILE_DIR}" "profiles/${PSPRECOMP_PROFILE}")
+endif()
+
+# Build the executables registered with CTest without building the game or
+# overlays. Test names match their executable targets in the framework/profile.
+if(PSPRECOMP_BUILD_TESTS)
+    get_property(_psprecomp_test_targets DIRECTORY PROPERTY TESTS)
+    if(NOT PSPRECOMP_PROFILE STREQUAL "")
+        get_property(_psprecomp_profile_tests DIRECTORY "${PSPRECOMP_PROFILE_DIR}" PROPERTY TESTS)
+        list(APPEND _psprecomp_test_targets ${_psprecomp_profile_tests})
+    endif()
+    add_custom_target(psprecomp_test_binaries DEPENDS ${_psprecomp_test_targets})
+endif()
+
+if(PSPRECOMP_BUILD_TESTS)
+    add_executable(psprecomp_runtime_contract_tests tests/runtime_contract_tests.cpp)
+    target_link_libraries(psprecomp_runtime_contract_tests PRIVATE psprecomp_core)
+    add_dependencies(psprecomp_runtime_contract_tests psp_analyze psp_recomp dump_function)
+    target_compile_definitions(psprecomp_runtime_contract_tests PRIVATE
+        PSPRECOMP_ANALYZE_PATH="$<TARGET_FILE:psp_analyze>"
+        PSPRECOMP_RECOMP_PATH="$<TARGET_FILE:psp_recomp>"
+        PSPRECOMP_DUMP_PATH="$<TARGET_FILE:dump_function>"
+        PSPRECOMP_TEST_COMPILER_PATH="${CMAKE_CXX_COMPILER}"
+        PSPRECOMP_TEST_INCLUDE_PATH="${PROJECT_SOURCE_DIR}/include"
+        PSPRECOMP_TEST_CMAKE_PATH="${CMAKE_COMMAND}"
+        PSPRECOMP_TEST_GENERATOR="${CMAKE_GENERATOR}")
+    add_test(NAME psprecomp_runtime_contract_tests COMMAND psprecomp_runtime_contract_tests)
+    set_tests_properties(psprecomp_runtime_contract_tests PROPERTIES TIMEOUT 60)
+    add_test(NAME psprecomp_memory_watch_contracts COMMAND psprecomp_runtime_contract_tests --memory-watch)
+    set_tests_properties(psprecomp_memory_watch_contracts PROPERTIES TIMEOUT 60
+        ENVIRONMENT "PSPRECOMP_WATCH_WRITE=0x08804000;PSPRECOMP_WATCH_WRITE_SIZE=4;PSPRECOMP_TRACE_VRAM_READS=1")
+    add_dependencies(psprecomp_test_binaries psprecomp_runtime_contract_tests)
 endif()
