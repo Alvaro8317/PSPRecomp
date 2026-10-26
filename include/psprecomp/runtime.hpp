@@ -373,7 +373,17 @@ private:
     std::uint64_t dispatch_work_count_{};
     std::unordered_map<std::string, HleLibrary, TransparentStringHash, std::equal_to<>> hle_;
     std::unordered_map<std::uint32_t, NativeFastPath> native_fast_paths_;
-    std::vector<const HleFunction *> import_bindings_;
+    // One cached binding per import slot. Slots are numbered per corpus, so
+    // the main executable and a --prefix module corpus both have a slot 0: a
+    // binding is reused only for the wrapper (library literal and NID) that
+    // made it, and rebound otherwise.
+    struct ImportBinding {
+        const HleFunction *function{};
+        const char *library{};
+        std::size_t library_size{};
+        std::uint32_t nid{};
+    };
+    std::vector<ImportBinding> import_bindings_;
     std::filesystem::path game_root_;
     bool stopped_{};
     std::string stop_reason_;

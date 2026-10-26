@@ -570,6 +570,28 @@ static void test_run_until() {
         "exchange_thread_execution_state lost the installed state");
 }
 
+// The main executable and a --prefix corpus number their import wrappers from
+// 0, so one slot serves several wrappers: each must reach its own HLE.
+static void test_import_slots_shared_by_corpora() {
+    psprecomp::Runtime runtime;
+    std::uint32_t main_calls = 0u;
+    std::uint32_t module_calls = 0u;
+    runtime.register_hle("MainLibrary", 0x11111111u,
+        [&main_calls](psprecomp::Runtime &, psprecomp::AllegrexContext &) { ++main_calls; });
+    runtime.register_hle("ModuleLibrary", 0x22222222u,
+        [&module_calls](psprecomp::Runtime &, psprecomp::AllegrexContext &) { ++module_calls; });
+    psprecomp::AllegrexContext ctx{};
+    for (int round = 0; round < 3; ++round) {
+        runtime.invoke_import_cached(0u, "MainLibrary", 0x11111111u, ctx);
+        runtime.invoke_import_cached(0u, "ModuleLibrary", 0x22222222u, ctx);
+    }
+    // Same library, another NID, same slot.
+    runtime.invoke_import_cached(0u, "MainLibrary", 0x22222222u, ctx);
+    require(main_calls == 3u && module_calls == 3u, "An import slot shared by two corpora reached the wrong HLE");
+    require(runtime.stopped() && runtime.stop_reason() == "Missing HLE import MainLibrary::0x22222222",
+        "A cached slot hid a missing import of another wrapper");
+}
+
 static void put16(std::vector<std::uint8_t> &bytes, std::size_t offset, std::uint16_t value) {
     bytes[offset] = static_cast<std::uint8_t>(value);
     bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8u);
@@ -1452,6 +1474,7 @@ int main() {
         test_vfpu_opcode_space();
         test_interpreter_vfpu_executor();
         test_run_until();
+        test_import_slots_shared_by_corpora();
 
         psprecomp::GuestMemory mem;
         mem.store32(0x08800000u, 0x12345678u);

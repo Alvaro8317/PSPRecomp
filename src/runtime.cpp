@@ -168,7 +168,7 @@ Runtime::Runtime(std::uint32_t ram_size) : memory_(ram_size) {
     // Most commercial PSP titles use a few hundred import stubs. Seed a small
     // binding table so first use of a late-numbered import does not reallocate
     // in the middle of guest execution; larger profiles can still grow it.
-    import_bindings_.resize(256u, nullptr);
+    import_bindings_.resize(256u);
     hle_histogram_enabled_ = std::getenv("PSPRECOMP_HLE_HISTOGRAM") != nullptr;
 #if defined(PSPRECOMP_AOT_PRODUCTION_FASTPATHS)
     track_dispatch_counters_ = false;
@@ -1263,7 +1263,11 @@ void Runtime::invoke_import_cached(
     std::uint32_t slot, std::string_view library, std::uint32_t nid, AllegrexContext &ctx) {
     if (hle_histogram_enabled_) ++hle_histogram_[hle_key(library, nid)];
 
-    const HleFunction *bound = slot < import_bindings_.size() ? import_bindings_[slot] : nullptr;
+    const ImportBinding *cached = slot < import_bindings_.size() ? &import_bindings_[slot] : nullptr;
+    const HleFunction *bound = cached != nullptr && cached->function != nullptr && cached->nid == nid &&
+            cached->library == library.data() && cached->library_size == library.size()
+        ? cached->function
+        : nullptr;
     if (bound == nullptr) {
         const auto library_it = hle_.find(library);
         const auto function_it = library_it != hle_.end() ? library_it->second.find(nid) : HleLibrary::const_iterator{};
@@ -1273,9 +1277,9 @@ void Runtime::invoke_import_cached(
             stop("Missing HLE import " + library_name + "::" + name);
             return;
         }
-        if (slot >= import_bindings_.size()) import_bindings_.resize(static_cast<std::size_t>(slot) + 1u, nullptr);
+        if (slot >= import_bindings_.size()) import_bindings_.resize(static_cast<std::size_t>(slot) + 1u);
         bound = &function_it->second;
-        import_bindings_[slot] = bound;
+        import_bindings_[slot] = ImportBinding{bound, library.data(), library.size(), nid};
     }
 
     (*bound)(*this, ctx);
