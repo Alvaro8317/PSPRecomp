@@ -102,6 +102,43 @@ public:
     void stop(std::string reason);
     [[nodiscard]] bool stopped() const noexcept;
     [[nodiscard]] const std::string &stop_reason() const noexcept;
+    // Forgets an earlier stop() so run_until() may dispatch again.
+    void clear_stop() noexcept;
+
+    // Per-thread dispatch for hosts that give every guest thread its own
+    // native stack (fibers, coroutines).
+    //
+    // run_until() dispatches cpu() from its current pc until the pc reaches
+    // `return_pc` (the guest returned to the address the host put in $ra),
+    // stop() is called, or `max_dispatches` outer dispatches ran (0: no
+    // limit). Unlike run() it:
+    //   - may be entered again on another native stack while an earlier
+    //     run_until() frame is suspended, so each guest thread (and each
+    //     guest callback nested in one) runs its own loop;
+    //   - neither resets cpu().pc nor clears an earlier stop(): a stopped
+    //     runtime returns Stopped at once;
+    //   - keeps no heap-owning object in its frame, so a host may abandon a
+    //     native stack that is suspended inside it (a guest thread that exits
+    //     from an HLE call) without leaking;
+    //   - turns a psprecomp::Error thrown by guest code into stop(), with the
+    //     dispatch pc and registers, instead of letting it unwind the stack.
+    // The starvation, missing-function, pre/post dispatch and heartbeat hooks
+    // and the interpreter fallback behave as in run(). When the host switches
+    // to another guest thread it swaps the contents of cpu() and the thread's
+    // execution state (exchange_thread_execution_state) itself.
+    enum class RunUntilResult : std::uint8_t { Returned, Stopped, DispatchLimit };
+    [[nodiscard]] RunUntilResult run_until(std::uint32_t return_pc, std::uint64_t max_dispatches = 0u);
+
+    // Runtime state that belongs to the guest thread being executed. A host
+    // that switches native stacks between guest threads installs the state of
+    // the thread it resumes and keeps the one it gets back with the thread
+    // it suspends; otherwise a thread suspended inside cross-unit chaining
+    // would count against the chain depth of every other thread, forever if
+    // its stack is abandoned.
+    struct ThreadExecutionState {
+        std::uint32_t chain_depth{};
+    };
+    [[nodiscard]] ThreadExecutionState exchange_thread_execution_state(ThreadExecutionState next) noexcept;
 
     void unsupported(std::uint32_t pc, std::uint32_t instruction, const std::string &reason);
     void arithmetic_overflow(std::uint32_t pc, std::uint32_t instruction);

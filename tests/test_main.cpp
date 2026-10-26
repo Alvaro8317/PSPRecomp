@@ -472,6 +472,104 @@ static void test_import_return_context_guard() {
     psprecomp::set_runtime_thread_identity(-1, "none");
 }
 
+// run_until(): the per-thread dispatch loop for hosts with one native stack per
+// guest thread. A host call made from guest code runs a guest callback in a
+// nested run_until() on the same stack, as a kernel HLE would.
+static constexpr std::uint32_t kRunUntilEntry = 0x08804000u;
+static constexpr std::uint32_t kRunUntilCallback = 0x08804100u;
+static constexpr std::uint32_t kRunUntilHostCall = 0x08804200u;
+static constexpr std::uint32_t kRunUntilThrow = 0x08804300u;
+static constexpr std::uint32_t kRunUntilSpin = 0x08804400u;
+static constexpr std::uint32_t kRunUntilThreadReturn = 0x09FFFF00u;
+static constexpr std::uint32_t kRunUntilCallbackReturn = 0x08000010u;
+static std::uint32_t run_until_spins = 0u;
+
+static void run_until_entry(psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+    ctx.gpr[2] = 7u;
+    ctx.gpr[31] = kRunUntilThreadReturn;
+    ctx.pc = kRunUntilHostCall;
+}
+static void run_until_callback(psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+    ctx.gpr[2] = ctx.gpr[4] + 40u;
+    ctx.pc = ctx.gpr[31];
+}
+static void run_until_host_call(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx) {
+    const psprecomp::AllegrexContext saved = ctx;
+    ctx.gpr[4] = 2u;
+    ctx.gpr[31] = kRunUntilCallbackReturn;
+    ctx.pc = kRunUntilCallback;
+    const auto result = runtime.run_until(kRunUntilCallbackReturn);
+    const std::uint32_t v0 = ctx.gpr[2];
+    ctx = saved;
+    ctx.gpr[3] = result == psprecomp::Runtime::RunUntilResult::Returned ? v0 : 0xDEADu;
+    ctx.pc = ctx.gpr[31];
+}
+static void run_until_throw(psprecomp::Runtime &, psprecomp::AllegrexContext &) {
+    throw psprecomp::Error("guest load out of range");
+}
+static void run_until_spin(psprecomp::Runtime &, psprecomp::AllegrexContext &ctx) {
+    ++run_until_spins;
+    ctx.pc = kRunUntilSpin;
+}
+
+static void test_run_until() {
+    psprecomp::Runtime runtime;
+    runtime.register_function(kRunUntilEntry, &run_until_entry, "run_until_entry");
+    runtime.register_function(kRunUntilCallback, &run_until_callback, "run_until_callback");
+    runtime.register_function(kRunUntilHostCall, &run_until_host_call, "run_until_host_call");
+    runtime.register_function(kRunUntilThrow, &run_until_throw, "run_until_throw");
+    runtime.register_function(kRunUntilSpin, &run_until_spin, "run_until_spin");
+    using Result = psprecomp::Runtime::RunUntilResult;
+
+    // Returns where the guest jumps to the return pc, through a nested loop.
+    runtime.cpu() = psprecomp::AllegrexContext{};
+    runtime.cpu().pc = kRunUntilEntry;
+    require(runtime.run_until(kRunUntilThreadReturn) == Result::Returned, "run_until did not return");
+    require(runtime.cpu().pc == kRunUntilThreadReturn, "run_until left with the wrong pc");
+    require(runtime.cpu().gpr[2] == 7u && runtime.cpu().gpr[3] == 42u,
+        "A nested run_until did not run the callback or restore the caller");
+    // A mirror of the return pc is the same address.
+    runtime.cpu().pc = kRunUntilEntry;
+    require(runtime.run_until(kRunUntilThreadReturn | 0x40000000u) == Result::Returned,
+        "run_until compared the return pc without masking the mirror");
+
+    // The dispatch limit.
+    run_until_spins = 0u;
+    runtime.cpu().pc = kRunUntilSpin;
+    require(runtime.run_until(kRunUntilThreadReturn, 5u) == Result::DispatchLimit && run_until_spins == 5u,
+        "run_until ignored its dispatch limit");
+    require(!runtime.stopped(), "Reaching the dispatch limit stopped the runtime");
+
+    // A guest error becomes a stop that names the dispatch, and a stop sticks.
+    runtime.cpu().pc = kRunUntilThrow;
+    require(runtime.run_until(kRunUntilThreadReturn) == Result::Stopped, "run_until let a guest error escape");
+    require(runtime.stop_reason().find("guest load out of range") != std::string::npos &&
+            runtime.stop_reason().find(psprecomp::hex32(kRunUntilThrow)) != std::string::npos,
+        "run_until's stop reason lost the error or the dispatch pc");
+    runtime.cpu().pc = kRunUntilEntry;
+    require(runtime.run_until(kRunUntilThreadReturn) == Result::Stopped && runtime.cpu().pc == kRunUntilEntry,
+        "run_until dispatched on a stopped runtime");
+    runtime.clear_stop();
+    require(!runtime.stopped() && runtime.stop_reason().empty(), "clear_stop kept the stop");
+    require(runtime.run_until(kRunUntilThreadReturn) == Result::Returned, "run_until did not resume after clear_stop");
+
+    // No function at the pc (interpreter off): a visible stop.
+    const bool interpreter = psprecomp::interpreter_fallback_enabled();
+    psprecomp::set_interpreter_fallback_enabled(false);
+    runtime.cpu().pc = 0x08805000u;
+    require(runtime.run_until(kRunUntilThreadReturn) == Result::Stopped &&
+            runtime.stop_reason() == "No recompiled function registered at 0x08805000",
+        "run_until did not stop on a missing function");
+    psprecomp::set_interpreter_fallback_enabled(interpreter);
+    runtime.clear_stop();
+
+    // The per-thread execution state is swapped, not shared.
+    const auto initial = runtime.exchange_thread_execution_state({3u});
+    require(initial.chain_depth == 0u, "A fresh runtime has a nonzero chain depth");
+    require(runtime.exchange_thread_execution_state(initial).chain_depth == 3u,
+        "exchange_thread_execution_state lost the installed state");
+}
+
 static void put16(std::vector<std::uint8_t> &bytes, std::size_t offset, std::uint16_t value) {
     bytes[offset] = static_cast<std::uint8_t>(value);
     bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8u);
@@ -1353,6 +1451,7 @@ int main() {
         test_interpreter_budget_and_disable();
         test_vfpu_opcode_space();
         test_interpreter_vfpu_executor();
+        test_run_until();
 
         psprecomp::GuestMemory mem;
         mem.store32(0x08800000u, 0x12345678u);

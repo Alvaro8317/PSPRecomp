@@ -1104,9 +1104,66 @@ void Runtime::run(std::uint32_t entry, std::uint64_t max_dispatches) {
     report_interpreter_stats();
 }
 
+Runtime::RunUntilResult Runtime::run_until(std::uint32_t return_pc, std::uint64_t max_dispatches) {
+    // Only scalars live in this frame (see the header): a host may abandon the
+    // native stack while a dispatch below it is suspended.
+    const std::uint32_t canonical_return = memory_.canonical(return_pc);
+    const RuntimeHeartbeatHook heartbeat = g_heartbeat_hook;
+    const std::uint64_t heartbeat_every = heartbeat != nullptr ? g_heartbeat_interval : 0u;
+    std::uint64_t executed = 0u;
+    for (;;) {
+        if (stopped_) return RunUntilResult::Stopped;
+        if (memory_.canonical(cpu_.pc) == canonical_return) return RunUntilResult::Returned;
+        if (max_dispatches != 0u && executed >= max_dispatches) return RunUntilResult::DispatchLimit;
+        ++executed;
+        const std::uint32_t before = cpu_.pc;
+        chain_context_invalidated_ = false;
+        const std::int32_t dispatch_thread_uid = g_runtime_thread_uid;
+        RecompiledFunction function = lookup_generated_unit(before);
+        if (function == nullptr) function = lookup_function(before);
+        if (function == nullptr && g_missing_function_hook != nullptr && g_missing_function_hook(*this, cpu_, before))
+            function = lookup_function(before);
+        if (function == nullptr) {
+            if (!run_interpreter_fallback(cpu_)) {
+                stop("No recompiled function registered at " + hex32(before));
+                return RunUntilResult::Stopped;
+            }
+        } else {
+            g_runtime_dispatch_pc = before;
+            if (g_pre_dispatch_hook != nullptr) g_pre_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
+            try {
+                function(*this, cpu_);
+            } catch (const Error &e) {
+                const FunctionEntry *function_entry = lookup_entry(before);
+                std::ostringstream message;
+                message << e.what() << " while executing "
+                        << (function_entry != nullptr ? function_entry->name : std::string("unknown"))
+                        << " dispatch=" << hex32(before) << " guest_pc=" << hex32(cpu_.pc);
+                append_gpr_dump(message, cpu_);
+                stop(message.str());
+                return RunUntilResult::Stopped;
+            }
+            if (!stopped_ && g_post_dispatch_hook != nullptr)
+                g_post_dispatch_hook(*this, cpu_, before, dispatch_thread_uid);
+        }
+        if (heartbeat_every != 0u && executed % heartbeat_every == 0u) heartbeat(executed, cpu_.pc);
+        if (!stopped_) (void)account_dispatch_work(cpu_, true);
+    }
+}
+
+Runtime::ThreadExecutionState Runtime::exchange_thread_execution_state(ThreadExecutionState next) noexcept {
+    const ThreadExecutionState previous{chain_depth_};
+    chain_depth_ = next.chain_depth;
+    return previous;
+}
+
 void Runtime::stop(std::string reason) {
     stopped_ = true;
     stop_reason_ = std::move(reason);
+}
+void Runtime::clear_stop() noexcept {
+    stopped_ = false;
+    stop_reason_.clear();
 }
 bool Runtime::stopped() const noexcept {
     return stopped_;
