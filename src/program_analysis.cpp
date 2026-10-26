@@ -580,11 +580,23 @@ AnalysisHints load_analysis_hints(const std::filesystem::path &path) {
         } else if (directive == "jumptable" && args.size() >= 2u) {
             auto &targets = hints.jump_tables[parse_hint_number(args[0], line)];
             for (std::size_t i = 1; i < args.size(); ++i) targets.push_back(parse_hint_number(args[i], line));
+        } else if (directive == "patch" && args.size() == 2u) {
+            const std::uint32_t address = parse_hint_number(args[0], line);
+            if ((address & 3u) != 0u) throw Error("Unaligned patch address on hints line " + std::to_string(line));
+            hints.patches[address] = parse_hint_number(args[1], line);
         } else {
             throw Error("Invalid analysis hints line " + std::to_string(line) + " in " + path.string());
         }
     }
     return hints;
+}
+
+void apply_code_patches(GuestMemory &memory, const AnalysisHints &hints) {
+    for (const auto &[address, word] : hints.patches) {
+        if ((address & 3u) != 0u || !memory.contains(address, 4u))
+            throw Error("Patch address is unaligned or outside guest memory: " + hex32(address));
+        memory.store32(address, word);
+    }
 }
 
 } // namespace psprecomp

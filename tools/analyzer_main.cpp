@@ -106,6 +106,7 @@ int main(int argc, char **argv) {
         auto elf = psprecomp::Elf32Image::from_file(input);
         psprecomp::GuestMemory memory(elf.required_ram_size(load_base));
         const auto relocations = elf.load_and_relocate(memory, load_base);
+        psprecomp::apply_code_patches(memory, hints);
         const auto module = elf.find_module_info(memory, load_base);
         psprecomp::NidRegistry nids;
         const char *nids_csv = std::getenv("PSPRECOMP_NIDS_CSV");

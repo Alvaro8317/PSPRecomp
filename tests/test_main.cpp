@@ -1014,6 +1014,31 @@ static void test_analysis_hints() {
         rejected = true;
     }
     require(rejected, "Malformed analysis hints were accepted");
+
+    // patch: the word the program writes over its own code before it runs.
+    {
+        std::ofstream out(hints_path);
+        out << "patch 0x08804020 0x03E00008\npatch 08804024 0\n";
+    }
+    const auto patch_hints = psprecomp::load_analysis_hints(hints_path);
+    require(patch_hints.patches.size() == 2u && patch_hints.patches.at(0x08804020u) == 0x03E00008u,
+            "Patch hints were not parsed");
+    psprecomp::apply_code_patches(memory, patch_hints);
+    require(memory.load32(0x08804020u) == 0x03E00008u && memory.load32(0x08804024u) == 0u,
+            "Patch hints were not applied to the image");
+    for (const char *bad : {"patch 0x08804022 0\n", "patch 0x08804020\n"}) {
+        {
+            std::ofstream out(hints_path);
+            out << bad;
+        }
+        rejected = false;
+        try {
+            (void)psprecomp::load_analysis_hints(hints_path);
+        } catch (const psprecomp::Error &) {
+            rejected = true;
+        }
+        require(rejected, "A malformed patch hint was accepted");
+    }
     std::filesystem::remove_all(root);
 }
 

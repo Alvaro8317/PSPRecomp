@@ -52,12 +52,22 @@ struct AnalysisHints {
     // Resolved `jr` sites: the targets become blocks of the function that
     // owns the jr, so they are emitted and registered as dispatcher entries.
     std::map<std::uint32_t, std::vector<std::uint32_t>> jump_tables;
+    // Instruction words the program itself overwrites before they can run
+    // (for example debug functions patched to `jr ra; nop` at start-up).
+    // Tools apply them to the loaded image before analysis and emission, so
+    // the corpus matches the code that actually executes. address -> word.
+    std::map<std::uint32_t, std::uint32_t> patches;
 };
+
+// Writes AnalysisHints::patches into a loaded image. Throws psprecomp::Error
+// for an unaligned address or one outside guest memory.
+void apply_code_patches(GuestMemory &memory, const AnalysisHints &hints);
 
 // Reads hints from a text file, one directive per line ('#' starts a comment):
 //   code <start> <end>                 executable range [start, end)
 //   seed <address> [source]            function entry
 //   jumptable <jr address> <target>... targets of an indirect jump
+//   patch <address> <word>             instruction word to use at address
 // Numbers are hexadecimal with or without 0x. Throws psprecomp::Error.
 [[nodiscard]] AnalysisHints load_analysis_hints(const std::filesystem::path &path);
 

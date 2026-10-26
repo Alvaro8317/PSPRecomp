@@ -1858,6 +1858,7 @@ int generate_auto(const std::filesystem::path &elf_path, const std::filesystem::
     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
     psprecomp::GuestMemory memory(elf.required_ram_size(load_base));
     (void)elf.load_and_relocate(memory, load_base);
+    psprecomp::apply_code_patches(memory, hints);
     progress("analyzing executable");
     std::vector<psprecomp::PspImport> imports;
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
