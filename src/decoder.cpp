@@ -880,4 +880,19 @@ DecodedInstruction decode_allegrex(std::uint32_t word) {
     return d;
 }
 
+bool is_vfpu_opcode_space(std::uint32_t word) noexcept {
+    switch (word >> 26u) {
+    case 0x12u:                            // COP2: mfv/mtv/mfvc/mtvc ...
+        return ((word >> 21u) & 0x1Fu) != 0x08u; // ... but not BC2 (bvf/bvt/bvfl/bvtl).
+    case 0x18u: case 0x19u: case 0x1Bu:    // VFPU0, VFPU1, VFPU3
+    case 0x32u: case 0x35u: case 0x36u:    // lv.s, lvl.q/lvr.q, lv.q
+    case 0x34u: case 0x37u: case 0x3Cu:    // VFPU4, VFPU5, VFPU6
+    case 0x3Au: case 0x3Du: case 0x3Eu:    // sv.s, svl.q/svr.q, sv.q
+    case 0x3Fu:                            // vnop/vsync/vflush
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace psprecomp

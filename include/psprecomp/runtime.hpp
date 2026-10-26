@@ -105,6 +105,13 @@ public:
 
     void unsupported(std::uint32_t pc, std::uint32_t instruction, const std::string &reason);
     void arithmetic_overflow(std::uint32_t pc, std::uint32_t instruction);
+    // Runs one VFPU instruction through the executor installed with
+    // set_vfpu_executor(). Code generated with `psp_recomp --vfpu-executor`
+    // calls this for every word in the VFPU opcode space (see
+    // is_vfpu_opcode_space), and so does the interpreter fallback when an
+    // executor is installed. Returns false, after unsupported(), when there is
+    // no executor or it rejects the word; the caller then leaves the unit.
+    [[nodiscard]] bool execute_vfpu(AllegrexContext &ctx, std::uint32_t pc, std::uint32_t word);
     void invoke_import(std::string_view library, std::uint32_t nid, AllegrexContext &ctx);
     // Generated import wrappers have a stable numeric slot. Resolve the
     // library/NID hash maps only on the first call, then invoke the bound HLE
@@ -374,6 +381,19 @@ void set_runtime_missing_function_hook(RuntimeMissingFunctionHook hook) noexcept
 // there; returning false stops the runtime with the usual diagnostics.
 using RuntimeUnsupportedHook = bool (*)(Runtime &, AllegrexContext &, std::uint32_t pc, std::uint32_t instruction);
 void set_runtime_unsupported_hook(RuntimeUnsupportedHook hook) noexcept;
+
+// Executes one VFPU instruction (any word for which is_vfpu_opcode_space() is
+// true) on ctx, including its memory accesses and prefix handling, and leaves
+// ctx.pc alone. Returns false if it cannot execute the word.
+//
+// The framework's own VFPU lowering approximates the transcendental
+// functions with the host libm. A profile that needs results bit-exact with a
+// reference implementation installs an executor here and generates its
+// corpus with `psp_recomp --vfpu-executor`; the interpreter fallback then uses
+// the same executor, so both paths agree.
+using VfpuExecutor = bool (*)(Runtime &, AllegrexContext &, std::uint32_t pc, std::uint32_t word);
+void set_vfpu_executor(VfpuExecutor executor) noexcept;
+[[nodiscard]] VfpuExecutor vfpu_executor() noexcept;
 
 using RuntimeHeartbeatHook = void (*)(std::uint64_t dispatch, std::uint32_t pc);
 void set_runtime_heartbeat_hook(RuntimeHeartbeatHook hook, std::uint64_t interval) noexcept;

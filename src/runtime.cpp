@@ -31,6 +31,7 @@ std::uint64_t g_heartbeat_interval = 0u;
 RuntimeStarvationHook g_starvation_hook = nullptr;
 RuntimeMissingFunctionHook g_missing_function_hook = nullptr;
 RuntimeUnsupportedHook g_unsupported_hook = nullptr;
+VfpuExecutor g_vfpu_executor = nullptr;
 std::uint64_t g_starvation_interval = 0u;
 RuntimePreDispatchHook g_pre_dispatch_hook = nullptr;
 RuntimePostDispatchHook g_post_dispatch_hook = nullptr;
@@ -95,6 +96,14 @@ void set_runtime_heartbeat_hook(RuntimeHeartbeatHook hook, std::uint64_t interva
 
 void set_runtime_unsupported_hook(RuntimeUnsupportedHook hook) noexcept {
     g_unsupported_hook = hook;
+}
+
+void set_vfpu_executor(VfpuExecutor executor) noexcept {
+    g_vfpu_executor = executor;
+}
+
+VfpuExecutor vfpu_executor() noexcept {
+    return g_vfpu_executor;
 }
 
 void set_runtime_missing_function_hook(RuntimeMissingFunctionHook hook) noexcept {
@@ -1114,6 +1123,13 @@ void Runtime::unsupported(std::uint32_t pc, std::uint32_t instruction, const std
         return;
     }
     stop("Unsupported Allegrex instruction " + hex32(instruction) + " at " + hex32(pc) + ": " + reason);
+}
+
+bool Runtime::execute_vfpu(AllegrexContext &ctx, std::uint32_t pc, std::uint32_t word) {
+    if (g_vfpu_executor != nullptr && g_vfpu_executor(*this, ctx, pc, word)) return true;
+    ctx.pc = pc;
+    unsupported(pc, word, g_vfpu_executor == nullptr ? "no VFPU executor installed" : "rejected by the VFPU executor");
+    return false;
 }
 
 void Runtime::arithmetic_overflow(std::uint32_t pc, std::uint32_t instruction) {

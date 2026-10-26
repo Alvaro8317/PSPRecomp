@@ -251,6 +251,9 @@ void charge_entry(std::uint32_t pc, std::uint64_t instructions) {
 // the runtime stopped or an unsupported-instruction hook asked for a retry; the
 // interpreter then hands control back to the outer dispatcher.
 bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction &d, std::uint32_t pc) {
+    // An installed VFPU executor owns the whole VFPU opcode space, exactly as
+    // in code generated with --vfpu-executor, so both paths give one result.
+    if (vfpu_executor() != nullptr && is_vfpu_opcode_space(d.word)) return rt.execute_vfpu(ctx, pc, d.word);
     const auto imm = static_cast<std::uint32_t>(static_cast<std::int32_t>(d.immediate));
     const auto uimm = static_cast<std::uint32_t>(static_cast<std::uint16_t>(d.immediate));
     GuestMemory &memory = rt.memory();

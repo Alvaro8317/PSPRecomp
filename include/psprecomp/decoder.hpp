@@ -182,4 +182,11 @@ struct DecodedInstruction {
 
 [[nodiscard]] DecodedInstruction decode_allegrex(std::uint32_t word);
 
+// True for every word in the VFPU opcode space except the VFPU branches
+// (bvf/bvt/bvfl/bvtl): COP2 moves (mfv/mtv/mfvc/mtvc), the VFPU0/1/3/4/5/6
+// arithmetic groups, the VFPU loads and stores (lv.s/lv.q/lvl/lvr,
+// sv.s/sv.q/svl/svr) and the vnop/vsync/vflush group. A VFPU executor
+// (see set_vfpu_executor in runtime.hpp) receives exactly these words.
+[[nodiscard]] bool is_vfpu_opcode_space(std::uint32_t word) noexcept;
+
 } // namespace psprecomp

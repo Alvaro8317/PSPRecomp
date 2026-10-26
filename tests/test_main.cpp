@@ -392,6 +392,60 @@ static void test_interpreter_budget_and_disable() {
         "PSPRECOMP_NO_INTERPRETER did not restore the strict dispatch stop");
 }
 
+static std::uint32_t vfpu_executor_calls = 0u;
+static std::uint32_t vfpu_executor_last_pc = 0u;
+static std::uint32_t vfpu_executor_last_word = 0u;
+static bool test_vfpu_executor(
+    psprecomp::Runtime &, psprecomp::AllegrexContext &ctx, std::uint32_t pc, std::uint32_t word) {
+    ++vfpu_executor_calls;
+    vfpu_executor_last_pc = pc;
+    vfpu_executor_last_word = word;
+    if (word == 0xD0000000u) return false; // Pretend the executor cannot run this one.
+    ctx.gpr[2] = word;
+    return true;
+}
+
+static void test_vfpu_opcode_space() {
+    require(psprecomp::is_vfpu_opcode_space(0x60000000u), "VFPU0 word not in the VFPU opcode space");
+    require(psprecomp::is_vfpu_opcode_space(0xD8000000u), "lv.q not in the VFPU opcode space");
+    require(psprecomp::is_vfpu_opcode_space(0xF8000000u), "sv.q not in the VFPU opcode space");
+    require(psprecomp::is_vfpu_opcode_space(0x48600000u), "mfv not in the VFPU opcode space");
+    require(psprecomp::is_vfpu_opcode_space(0xFFFF0000u), "vflush not in the VFPU opcode space");
+    require(!psprecomp::is_vfpu_opcode_space(0x49000003u), "bvf must stay with the branch lowering");
+    require(!psprecomp::is_vfpu_opcode_space(0x24820001u), "addiu is not a VFPU word");
+    require(!psprecomp::is_vfpu_opcode_space(0xC4800000u), "lwc1 is not a VFPU word");
+}
+
+static void test_interpreter_vfpu_executor() {
+    psprecomp::Runtime runtime;
+    runtime.register_function(kInterpreterExit, &interpreter_exit_function, "interpreter_exit");
+    load_program(runtime, kInterpreterBase,
+        {
+            0x60000000u,                        // vadd.s S000, S000, S000 -> executor
+            mips_jump(0x02u, kInterpreterExit), // j kInterpreterExit
+            0xFFFF0000u,                        // vflush in the delay slot -> executor
+        });
+    vfpu_executor_calls = 0u;
+    psprecomp::set_vfpu_executor(&test_vfpu_executor);
+    psprecomp::AllegrexContext ctx{};
+    ctx.pc = kInterpreterBase;
+    const auto exit = psprecomp::interpret_allegrex(runtime, ctx);
+    require(exit == psprecomp::InterpreterExit::Dispatch && ctx.pc == kInterpreterExit,
+        "Interpreter with a VFPU executor did not reach the exit");
+    require(vfpu_executor_calls == 2u && vfpu_executor_last_pc == kInterpreterBase + 8u &&
+            vfpu_executor_last_word == 0xFFFF0000u && ctx.gpr[2] == 0xFFFF0000u,
+        "Interpreter did not hand both VFPU words (one in a delay slot) to the executor");
+
+    load_program(runtime, kInterpreterBase, {0xD0000000u, 0u});
+    runtime.run(kInterpreterBase, 4u);
+    require(runtime.stop_reason().find("rejected by the VFPU executor") != std::string::npos,
+        "A word the VFPU executor rejects must stop the runtime");
+    psprecomp::set_vfpu_executor(nullptr);
+    runtime.run(kInterpreterBase, 4u);
+    require(runtime.stop_reason().find("no VFPU executor") == std::string::npos,
+        "Without an executor the interpreter keeps its own VFPU lowering");
+}
+
 static void test_import_return_context_guard() {
     psprecomp::set_runtime_thread_identity(5, "UmdStreamThread");
     const auto worker_context = psprecomp::capture_runtime_execution_context();
@@ -1077,6 +1131,40 @@ static void test_automatic_profile_dispatch_target() {
 #endif
 }
 
+static void test_codegen_vfpu_executor() {
+#ifdef PSPRECOMP_CODEGEN_PATH
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_vfpu_executor_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto elf_path = root / "public.elf";
+    auto bytes = make_branch_delay_test_elf();
+    put32(bytes, 0x80, 0x60000000u); // vadd.s: goes to the executor
+    put32(bytes, 0x84, 0x10000002u); // b +2
+    put32(bytes, 0x88, 0xD8000000u); // lv.q in the delay slot: executor too
+    {
+        std::ofstream out(elf_path, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto read_unit = [&root](const char *directory) {
+        std::ifstream input(root / directory / "generated_unit_0000.cpp");
+        return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    };
+    const auto command = shell_quote(codegen_tool_path()) + " " + shell_quote(elf_path) + " --auto ";
+    require(std::system(shell_command(command + shell_quote(root / "with") + " --vfpu-executor").c_str()) == 0,
+        "psp_recomp --vfpu-executor failed");
+    require(std::system(shell_command(command + shell_quote(root / "without")).c_str()) == 0,
+        "psp_recomp without --vfpu-executor failed");
+    const std::string with = read_unit("with");
+    const std::string without = read_unit("without");
+    require(with.find("if (!rt.execute_vfpu(ctx, 0x08804000u, 0x60000000u)) return;") != std::string::npos &&
+            with.find("if (!rt.execute_vfpu(ctx, 0x08804008u, 0xD8000000u)) return;") != std::string::npos,
+        "--vfpu-executor did not route VFPU words, delay slots included, to the executor");
+    require(without.find("rt.execute_vfpu") == std::string::npos,
+        "Without --vfpu-executor the built-in VFPU lowering must stay");
+    std::filesystem::remove_all(root);
+#endif
+}
+
 static void test_automatic_cross_unit_tail_chaining() {
 #ifndef PSPRECOMP_CODEGEN_PATH
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
@@ -1205,6 +1293,8 @@ int main() {
         test_interpreter_floating_point();
         test_interpreter_dispatch_fallback();
         test_interpreter_budget_and_disable();
+        test_vfpu_opcode_space();
+        test_interpreter_vfpu_executor();
 
         psprecomp::GuestMemory mem;
         mem.store32(0x08800000u, 0x12345678u);
@@ -2005,6 +2095,7 @@ int main() {
         test_automatic_cfg_and_codegen();
         test_automatic_profile_dispatch_target();
         test_automatic_cross_unit_tail_chaining();
+        test_codegen_vfpu_executor();
         test_materialized_function_pointer_discovery();
         test_analysis_hints();
 

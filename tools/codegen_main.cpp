@@ -102,7 +102,18 @@ std::string reg(std::uint32_t index) {
     return "ctx.gpr[" + std::to_string(index) + "]";
 }
 
+// --vfpu-executor: every word in the VFPU opcode space (except the VFPU
+// branches) is handed to the runtime's VFPU executor instead of the built-in
+// lowering, so a profile can supply bit-exact VFPU semantics.
+bool g_vfpu_executor = false;
+
 std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t pc) {
+    if (g_vfpu_executor && psprecomp::is_vfpu_opcode_space(d.word)) {
+        std::ostringstream call;
+        call << "    if (!rt.execute_vfpu(ctx, " << psprecomp::hex32(pc) << "u, " << psprecomp::hex32(d.word)
+             << "u)) return;\n";
+        return call.str();
+    }
     const auto imm = static_cast<std::int32_t>(d.immediate);
     const auto uimm = static_cast<std::uint16_t>(d.immediate);
     std::ostringstream out;
@@ -1473,8 +1484,10 @@ std::string emit_function_source(
                 break;
             }
 
-            if (decoded.kind == psprecomp::OpcodeKind::Syscall || decoded.kind == psprecomp::OpcodeKind::Vfpu ||
-                decoded.kind == psprecomp::OpcodeKind::Unsupported) {
+            const bool to_vfpu_executor = g_vfpu_executor && psprecomp::is_vfpu_opcode_space(decoded.word);
+            if (!to_vfpu_executor &&
+                (decoded.kind == psprecomp::OpcodeKind::Syscall || decoded.kind == psprecomp::OpcodeKind::Vfpu ||
+                    decoded.kind == psprecomp::OpcodeKind::Unsupported)) {
                 body << "    rt.unsupported(" << psprecomp::hex32(pc) << "u, " << psprecomp::hex32(decoded.word)
                      << "u, \"" << cpp_escape(decoded.mnemonic) << " not lowered yet\"); return;\n";
                 break;
@@ -2070,6 +2083,10 @@ int main(int argc, char **argv) {
                     g_symbol_prefix = argv[++i];
                     continue;
                 }
+                if (option == "--vfpu-executor") {
+                    g_vfpu_executor = true;
+                    continue;
+                }
                 if (option == "--dispatch-target") {
                     if (i + 1 >= argc) throw psprecomp::Error("--dispatch-target needs an address");
                     const std::string text = argv[++i];
@@ -2089,7 +2106,8 @@ int main(int argc, char **argv) {
                 positional.size() > 1u ? static_cast<std::uint32_t>(std::stoul(positional[1], nullptr, 0)) : 0x4000u;
             if (positional.size() > 2u) {
                 std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                          << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>] [--hints <file>]\n";
+                          << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>] [--vfpu-executor]"
+                  << " [--hints <file>]\n";
                 return 2;
             }
             if (unit_span == 0u || (unit_span & 3u) != 0u)
@@ -2100,7 +2118,8 @@ int main(int argc, char **argv) {
         std::cerr << "Usage:\n"
                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
                   << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                  << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>] [--hints <file>]\n";
+                  << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>] [--vfpu-executor]"
+                  << " [--hints <file>]\n";
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";
