@@ -1195,8 +1195,12 @@ std::string direct_unit_chain_expression(
                 "u, " + std::to_string(found->second) + "u, " + psprecomp::hex32(target) + "u>(ctx, &aot_mem)";
         }
     }
-    return "rt.invoke_chained_direct<&" + generated_unit_cpp_name(unit) + ", " + std::to_string(unit) +
-        "u>(ctx, &aot_mem)";
+    // The target is not an entry of that unit (a gap between executable
+    // ranges, say). The unit then dispatches on ctx.pc, so it must hold the
+    // target: otherwise the unit would re-enter wherever the caller was
+    // dispatched from and run the wrong code.
+    return "(ctx.pc = " + psprecomp::hex32(target) + "u, rt.invoke_chained_direct<&" + generated_unit_cpp_name(unit) +
+        ", " + std::to_string(unit) + "u>(ctx, &aot_mem))";
 }
 
 void emit_target(std::ostringstream &body, std::uint32_t target, const std::set<std::uint32_t> &labels,
