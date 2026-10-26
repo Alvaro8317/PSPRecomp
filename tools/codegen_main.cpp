@@ -1863,9 +1863,19 @@ int generate_auto(const std::filesystem::path &elf_path, const std::filesystem::
     // jump (switch tables, virtual calls, overlay trampolines), so control can
     // arrive at an address the CFG walk never reached; anything not emitted
     // would stop the runtime. Words that are data decode to a trap instead.
+    //
+    // Import stubs are the exception: they are executed by their registered
+    // HLE wrappers, never as guest code. If a stub's own words (jr ra; nop
+    // until the loader patches them) became C++ labels, a same-unit JAL or J
+    // would `goto` them and return without ever reaching the import.
+    const auto in_import_stub = [&import_stubs](std::uint32_t pc) {
+        return import_stubs.contains(pc) || import_stubs.contains(pc - 4u);
+    };
     std::set<std::uint32_t> emitted_pcs;
     for (const auto &range : program.executable_ranges) {
-        for (std::uint32_t pc = range.start; pc + 4u <= range.end; pc += 4u) emitted_pcs.insert(pc);
+        for (std::uint32_t pc = range.start; pc + 4u <= range.end; pc += 4u) {
+            if (!in_import_stub(pc)) emitted_pcs.insert(pc);
+        }
     }
     const std::set<std::uint32_t> &global_entries = emitted_pcs;
 
