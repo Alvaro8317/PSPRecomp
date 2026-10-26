@@ -1126,7 +1126,12 @@ void Runtime::unsupported(std::uint32_t pc, std::uint32_t instruction, const std
 }
 
 bool Runtime::execute_vfpu(AllegrexContext &ctx, std::uint32_t pc, std::uint32_t word) {
-    if (g_vfpu_executor != nullptr && g_vfpu_executor(*this, ctx, pc, word)) return true;
+    if (g_vfpu_executor != nullptr) {
+        if (g_vfpu_executor(*this, ctx, pc, word)) return true;
+        // The executor stopped the runtime itself (a bad memory access, say):
+        // keep its more precise reason.
+        if (stopped_) return false;
+    }
     ctx.pc = pc;
     unsupported(pc, word, g_vfpu_executor == nullptr ? "no VFPU executor installed" : "rejected by the VFPU executor");
     return false;

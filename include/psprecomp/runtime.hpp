@@ -384,7 +384,8 @@ void set_runtime_unsupported_hook(RuntimeUnsupportedHook hook) noexcept;
 
 // Executes one VFPU instruction (any word for which is_vfpu_opcode_space() is
 // true) on ctx, including its memory accesses and prefix handling, and leaves
-// ctx.pc alone. Returns false if it cannot execute the word.
+// ctx.pc alone. Returns false if it cannot execute the word; it may call
+// Runtime::stop() first to give a precise reason, which is then kept.
 //
 // The framework's own VFPU lowering approximates the transcendental
 // functions with the host libm. A profile that needs results bit-exact with a
