@@ -1191,6 +1191,38 @@ static void test_codegen_vfpu_executor() {
 #endif
 }
 
+// A second corpus (an overlay or another resident module) is generated with
+// --prefix: its units register per address only, so registering it never
+// replaces the main corpus's dense unit layout (one layout per Runtime).
+static void test_prefixed_corpus_keeps_main_layout() {
+#ifdef PSPRECOMP_CODEGEN_PATH
+    const auto root = std::filesystem::temp_directory_path() / "psprecomp_prefixed_corpus_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto elf_path = root / "public.elf";
+    const auto bytes = make_branch_delay_test_elf();
+    {
+        std::ofstream out(elf_path, std::ios::binary);
+        out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto command = shell_quote(codegen_tool_path()) + " " + shell_quote(elf_path) + " --auto " +
+        shell_quote(root / "overlay") + " --prefix stage_test";
+    require(std::system(shell_command(command).c_str()) == 0, "psp_recomp --prefix failed");
+    const auto read = [&root](const char *name) {
+        std::ifstream input(root / "overlay" / name);
+        return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    };
+    const std::string registry = read("stage_test_registry.cpp");
+    const std::string unit = read("generated_unit_0000.cpp");
+    require(registry.find("void register_stage_test_functions(Runtime &runtime)") != std::string::npos,
+        "A prefixed corpus must have its own registration function");
+    require(unit.find("register_generated_unit") == std::string::npos &&
+            unit.find("runtime.register_function(0x08804000u, &stage_test_unit_0000") != std::string::npos,
+        "A prefixed corpus must register per address and stay out of the dense unit table");
+    std::filesystem::remove_all(root);
+#endif
+}
+
 static void test_automatic_cross_unit_tail_chaining() {
 #ifndef PSPRECOMP_CODEGEN_PATH
     throw std::runtime_error("PSPRECOMP_CODEGEN_PATH was not provided by CMake");
@@ -2122,6 +2154,7 @@ int main() {
         test_automatic_profile_dispatch_target();
         test_automatic_cross_unit_tail_chaining();
         test_codegen_vfpu_executor();
+        test_prefixed_corpus_keeps_main_layout();
         test_materialized_function_pointer_discovery();
         test_analysis_hints();
 
