@@ -9,8 +9,24 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <string_view>
 
 namespace {
+
+// Removes an optional "--hints <file>" pair from argv (any position) and
+// returns the hints it names; without it the analysis is purely automatic.
+psprecomp::AnalysisHints take_hints_option(int &argc, char **argv) {
+    psprecomp::AnalysisHints hints;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) != "--hints") continue;
+        if (i + 1 >= argc) throw psprecomp::Error("--hints needs a file");
+        hints = psprecomp::load_analysis_hints(argv[i + 1]);
+        for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+        argc -= 2;
+        break;
+    }
+    return hints;
+}
 std::string json_escape(const std::string &s) {
     std::string out;
     for (char c : s) {
@@ -77,8 +93,9 @@ void write_function_csv(const std::filesystem::path &path, const psprecomp::Prog
 
 int main(int argc, char **argv) {
     try {
+        const auto hints = take_hints_option(argc, argv);
         if (argc < 2 || argc > 4) {
-            std::cerr << "Usage: psp_analyze <decrypted ELF/PRX> [report.json] [load_base_hex]\n";
+            std::cerr << "Usage: psp_analyze <decrypted ELF/PRX> [report.json] [load_base_hex] [--hints <file>]\n";
             return 2;
         }
         const std::filesystem::path input = argv[1];
@@ -98,7 +115,7 @@ int main(int argc, char **argv) {
         if (nids_csv != nullptr && std::filesystem::is_regular_file(nids_csv)) nids.load_csv(nids_csv);
         std::vector<psprecomp::PspImport> imports;
         if (module) imports = elf.scan_imports(memory, *module);
-        const auto program = psprecomp::analyze_program(elf, memory, load_base);
+        const auto program = psprecomp::analyze_program(elf, memory, load_base, hints);
 
         std::filesystem::create_directories(
             output.parent_path().empty() ? std::filesystem::path(".") : output.parent_path());

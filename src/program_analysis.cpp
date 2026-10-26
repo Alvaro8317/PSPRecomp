@@ -1,12 +1,17 @@
 #include "psprecomp/program_analysis.hpp"
 
+#include "psprecomp/common.hpp"
 #include "psprecomp/decoder.hpp"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <deque>
+#include <fstream>
 #include <limits>
 #include <optional>
+#include <sstream>
+#include <string_view>
 #include <unordered_map>
 
 namespace psprecomp {
@@ -386,9 +391,12 @@ std::map<std::uint32_t, std::string> collect_initial_seeds(const Elf32Image &elf
     return seeds;
 }
 
-FunctionAnalysis analyze_function(std::uint32_t entry, const GuestMemory &memory,
-    const std::vector<ExecutableRange> &ranges, const std::map<std::uint32_t, std::string> &known_seeds,
-    std::size_t max_instructions) {
+FunctionAnalysis analyze_function(std::uint32_t entry,
+                                  const GuestMemory &memory,
+                                  const std::vector<ExecutableRange> &ranges,
+                                  const std::map<std::uint32_t, std::string> &known_seeds,
+                                  const std::map<std::uint32_t, std::vector<std::uint32_t>> &jump_tables,
+                                  std::size_t max_instructions) {
     FunctionAnalysis result{};
     result.entry = entry;
     std::deque<std::uint32_t> pending_blocks;
@@ -462,7 +470,16 @@ FunctionAnalysis analyze_function(std::uint32_t entry, const GuestMemory &memory
                 break;
             }
 
-            if (decoded.kind == OpcodeKind::Jr) break;
+            if (decoded.kind == OpcodeKind::Jr) {
+                if (const auto table = jump_tables.find(pc); table != jump_tables.end()) {
+                    for (const auto target : table->second) {
+                        if (is_executable_address(ranges, target) && queued_blocks.insert(target).second) {
+                            pending_blocks.push_back(target);
+                        }
+                    }
+                }
+                break;
+            }
 
             pc += decoded.has_delay_slot() ? 8u : 4u;
         }
@@ -480,18 +497,42 @@ bool is_executable_address(const std::vector<ExecutableRange> &ranges, std::uint
     return address >= range.start && address < range.end && (address & 3u) == 0u;
 }
 
-ProgramAnalysis analyze_program(const Elf32Image &elf, const GuestMemory &memory, std::uint32_t load_base,
-    std::size_t max_instructions_per_function) {
+ProgramAnalysis analyze_program(const Elf32Image &elf,
+                                const GuestMemory &memory,
+                                std::uint32_t load_base,
+                                std::size_t max_instructions_per_function) {
+    return analyze_program(elf, memory, load_base, AnalysisHints{}, max_instructions_per_function);
+}
+
+ProgramAnalysis analyze_program(const Elf32Image &elf,
+                                const GuestMemory &memory,
+                                std::uint32_t load_base,
+                                const AnalysisHints &hints,
+                                std::size_t max_instructions_per_function) {
     ProgramAnalysis program{};
-    program.executable_ranges = executable_ranges_for(elf, load_base);
+    if (hints.code_ranges.empty()) {
+        program.executable_ranges = executable_ranges_for(elf, load_base);
+    } else {
+        for (const auto &range : hints.code_ranges) {
+            if (range.end <= range.start || !memory.contains(range.start, range.end - range.start)) {
+                throw Error("Hint code range is empty or outside guest memory: " + hex32(range.start));
+            }
+            program.executable_ranges.push_back(range);
+        }
+        std::sort(program.executable_ranges.begin(), program.executable_ranges.end(),
+                  [](const auto &a, const auto &b) { return a.start < b.start; });
+    }
     program.seeds = collect_initial_seeds(elf, memory, load_base, program.executable_ranges);
+    for (const auto &[address, source] : hints.seeds) {
+        if (is_executable_address(program.executable_ranges, address)) program.seeds.try_emplace(address, source);
+    }
     program.functions.reserve(program.seeds.size());
 
     std::unordered_map<std::uint32_t, std::size_t> label_owners;
     for (const auto &[entry, source] : program.seeds) {
         (void)source;
-        auto function =
-            analyze_function(entry, memory, program.executable_ranges, program.seeds, max_instructions_per_function);
+        auto function = analyze_function(entry, memory, program.executable_ranges, program.seeds,
+                                         hints.jump_tables, max_instructions_per_function);
         for (const auto label : function.labels) program.covered_labels.insert(label);
         for (const auto label : function.entry_labels) {
             const auto [it, inserted] = label_owners.emplace(label, program.functions.size());
@@ -501,6 +542,49 @@ ProgramAnalysis analyze_program(const Elf32Image &elf, const GuestMemory &memory
         program.functions.push_back(std::move(function));
     }
     return program;
+}
+
+namespace {
+
+std::uint32_t parse_hint_number(const std::string &text, std::size_t line) {
+    std::string_view view(text);
+    if (view.starts_with("0x") || view.starts_with("0X")) view.remove_prefix(2u);
+    std::uint32_t value{};
+    const auto result = std::from_chars(view.data(), view.data() + view.size(), value, 16);
+    if (view.empty() || result.ec != std::errc{} || result.ptr != view.data() + view.size()) {
+        throw Error("Invalid number '" + text + "' in hints line " + std::to_string(line));
+    }
+    return value;
+}
+
+} // namespace
+
+AnalysisHints load_analysis_hints(const std::filesystem::path &path) {
+    std::ifstream in(path);
+    if (!in) throw Error("Cannot open analysis hints: " + path.string());
+    AnalysisHints hints;
+    std::string text;
+    std::size_t line = 0u;
+    while (std::getline(in, text)) {
+        ++line;
+        if (const auto comment = text.find('#'); comment != std::string::npos) text.erase(comment);
+        std::istringstream fields(text);
+        std::string directive;
+        if (!(fields >> directive)) continue;
+        std::vector<std::string> args;
+        for (std::string arg; fields >> arg;) args.push_back(arg);
+        if (directive == "code" && args.size() == 2u) {
+            hints.code_ranges.push_back({parse_hint_number(args[0], line), parse_hint_number(args[1], line)});
+        } else if (directive == "seed" && (args.size() == 1u || args.size() == 2u)) {
+            hints.seeds.try_emplace(parse_hint_number(args[0], line), args.size() == 2u ? args[1] : "hint");
+        } else if (directive == "jumptable" && args.size() >= 2u) {
+            auto &targets = hints.jump_tables[parse_hint_number(args[0], line)];
+            for (std::size_t i = 1; i < args.size(); ++i) targets.push_back(parse_hint_number(args[i], line));
+        } else {
+            throw Error("Invalid analysis hints line " + std::to_string(line) + " in " + path.string());
+        }
+    }
+    return hints;
 }
 
 } // namespace psprecomp

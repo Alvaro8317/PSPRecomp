@@ -24,6 +24,21 @@
 #include <vector>
 
 namespace {
+
+// Removes an optional "--hints <file>" pair from argv (any position) and
+// returns the hints it names; without it the analysis is purely automatic.
+psprecomp::AnalysisHints take_hints_option(int &argc, char **argv) {
+    psprecomp::AnalysisHints hints;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) != "--hints") continue;
+        if (i + 1 >= argc) throw psprecomp::Error("--hints needs a file");
+        hints = psprecomp::load_analysis_hints(argv[i + 1]);
+        for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+        argc -= 2;
+        break;
+    }
+    return hints;
+}
 struct Function {
     std::string name;
     std::uint32_t address{};
@@ -1817,7 +1832,8 @@ bool write_text_if_changed(const std::filesystem::path &path, const std::string 
 }
 
 int generate_auto(const std::filesystem::path &elf_path, const std::filesystem::path &output_dir,
-    std::uint32_t load_base, std::uint32_t unit_span_bytes, bool chain_units = true) {
+    std::uint32_t load_base, std::uint32_t unit_span_bytes, const psprecomp::AnalysisHints &hints,
+    bool chain_units = true) {
     const auto started = std::chrono::steady_clock::now();
     // Progress goes to stderr and is flushed per line so `tail -f` on a log
     // shows how far a long generation has advanced.
@@ -1834,7 +1850,7 @@ int generate_auto(const std::filesystem::path &elf_path, const std::filesystem::
     if (const auto module = elf.find_module_info(memory, load_base)) imports = elf.scan_imports(memory, *module);
     std::set<std::uint32_t> import_stubs;
     for (const auto &import : imports) import_stubs.insert(import.stub_address);
-    const auto program = psprecomp::analyze_program(elf, memory, load_base);
+    const auto program = psprecomp::analyze_program(elf, memory, load_base, hints);
     if (program.executable_ranges.empty()) throw psprecomp::Error("ELF has no executable ranges");
 
     progress("analysis done: " + std::to_string(program.functions.size()) + " functions, " +
@@ -2033,6 +2049,7 @@ int generate_auto(const std::filesystem::path &elf_path, const std::filesystem::
 
 int main(int argc, char **argv) {
     try {
+        const auto hints = take_hints_option(argc, argv);
         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
             std::vector<std::string> positional;
             for (int i = 4; i < argc; ++i) {
@@ -2062,18 +2079,18 @@ int main(int argc, char **argv) {
                 positional.size() > 1u ? static_cast<std::uint32_t>(std::stoul(positional[1], nullptr, 0)) : 0x4000u;
             if (positional.size() > 2u) {
                 std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                          << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>]\n";
+                          << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>] [--hints <file>]\n";
                 return 2;
             }
             if (unit_span == 0u || (unit_span & 3u) != 0u)
                 throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
-            return generate_auto(argv[1], argv[3], load_base, unit_span, g_symbol_prefix == "recomp");
+            return generate_auto(argv[1], argv[3], load_base, unit_span, hints, g_symbol_prefix == "recomp");
         }
         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
         std::cerr << "Usage:\n"
                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
                   << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
-                  << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>]\n";
+                  << " [--prefix <symbol_prefix>] [--dispatch-target <hex_address>] [--hints <file>]\n";
         return 2;
     } catch (const std::exception &e) {
         std::cerr << "psp_recomp error: " << e.what() << "\n";
