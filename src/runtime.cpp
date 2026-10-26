@@ -1292,15 +1292,22 @@ void Runtime::invoke_import(std::string_view library, std::uint32_t nid, Allegre
     // while a thread spinning on an operation the host never completes shows up
     // as a huge count on one or two wait imports.
     if (hle_histogram_enabled_) ++hle_histogram_[hle_key(library, nid)];
-    const auto library_it = hle_.find(library);
-    const auto function_it = library_it != hle_.end() ? library_it->second.find(nid) : HleLibrary::const_iterator{};
-    if (library_it == hle_.end() || function_it == library_it->second.end()) {
-        const std::string library_name(library);
-        const auto name = nids_.resolve(library_name, nid).value_or(hex32(nid));
-        stop("Missing HLE import " + library_name + "::" + name);
-        return;
+    // The iterators die before the call: an import that never returns (a
+    // thread exit on a fiber host) abandons this frame, and checked iterators
+    // (MSVC Debug, _GLIBCXX_DEBUG) stay linked to hle_ from the freed stack.
+    const HleFunction *function = nullptr;
+    {
+        const auto library_it = hle_.find(library);
+        const auto function_it = library_it != hle_.end() ? library_it->second.find(nid) : HleLibrary::const_iterator{};
+        if (library_it == hle_.end() || function_it == library_it->second.end()) {
+            const std::string library_name(library);
+            const auto name = nids_.resolve(library_name, nid).value_or(hex32(nid));
+            stop("Missing HLE import " + library_name + "::" + name);
+            return;
+        }
+        function = &function_it->second;
     }
-    function_it->second(*this, ctx);
+    (*function)(*this, ctx);
     if (!stopped_ && g_post_import_hook != nullptr) g_post_import_hook(*this, ctx);
 }
 
