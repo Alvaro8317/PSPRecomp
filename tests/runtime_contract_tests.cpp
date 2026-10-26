@@ -685,12 +685,16 @@ void integer_contracts() {
             cpu.gpr[8] = pair.first;
             cpu.gpr[9] = pair.second;
             step(runtime, cpu, r(8, 9, 0, 0, function));
+            // PPSSPP's Int_MulDivType, the PSP reference: divu by zero gives
+            // LO = 0xFFFF up to a dividend of 0xFFFF; INT_MIN / -1 gives HI = -1.
             if (pair.second == 0)
                 check(cpu.hi == pair.first &&
-                        cpu.lo == (function == 0x1Bu || static_cast<std::int32_t>(pair.first) >= 0 ? 0xFFFFFFFFu : 1u),
+                        cpu.lo ==
+                            (function == 0x1Bu ? (pair.first <= 0xFFFFu ? 0xFFFFu : 0xFFFFFFFFu)
+                                               : (static_cast<std::int32_t>(pair.first) >= 0 ? 0xFFFFFFFFu : 1u)),
                     "Divide zero result changed");
             else if (function == 0x1Au && pair.first == 0x80000000u)
-                check(cpu.lo == 0x80000000u && cpu.hi == 0, "Signed division overflow result changed");
+                check(cpu.lo == 0x80000000u && cpu.hi == 0xFFFFFFFFu, "Signed division overflow result changed");
             else
                 check(cpu.lo == pair.first / pair.second && cpu.hi == pair.first % pair.second,
                     "Division quotient or remainder changed");

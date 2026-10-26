@@ -390,18 +390,20 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
             out << "    { const std::int32_t dividend = static_cast<std::int32_t>(" << reg(d.rs) << "); "
                 << "const std::int32_t divisor = static_cast<std::int32_t>(" << reg(d.rt) << "); "
                 << "if (divisor == 0) { ctx.lo = dividend >= 0 ? 0xFFFFFFFFu : 1u; ctx.hi = static_cast<std::uint32_t>(dividend); } "
-                << "else if (dividend == static_cast<std::int32_t>(0x80000000u) && divisor == -1) { ctx.lo = 0x80000000u; ctx.hi = 0u; } "
+                << "else if (dividend == static_cast<std::int32_t>(0x80000000u) && divisor == -1) { ctx.lo = 0x80000000u; ctx.hi = 0xFFFFFFFFu; } "
                 << "else { ctx.lo = static_cast<std::uint32_t>(dividend / divisor); ctx.hi = static_cast<std::uint32_t>(dividend % divisor); } }\n";
         }
         break;
     case psprecomp::OpcodeKind::Divu:
+        // Divide by zero leaves LO = 0xFFFF for a dividend up to 0xFFFF and
+        // 0xFFFFFFFF above it (PPSSPP's Int_MulDivType, the PSP reference).
         if (d.rt == 0u) {
             out << "    { const std::uint32_t dividend = " << reg(d.rs) << "; "
-                << "ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; }\n";
+                << "ctx.lo = dividend <= 0xFFFFu ? 0xFFFFu : 0xFFFFFFFFu; ctx.hi = dividend; }\n";
         } else {
             out << "    { const std::uint32_t dividend = " << reg(d.rs)
                 << "; const std::uint32_t divisor = " << reg(d.rt) << "; "
-                << "if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } "
+                << "if (divisor == 0u) { ctx.lo = dividend <= 0xFFFFu ? 0xFFFFu : 0xFFFFFFFFu; ctx.hi = dividend; } "
                 << "else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }\n";
         }
         break;
@@ -1455,9 +1457,11 @@ std::string emit_function_source(
                         body << "    return;\n";
                     }
                 } else {
-                    const std::uint32_t link = decoded.rd == 0u ? 31u : decoded.rd;
+                    // jalr writes rd; rd = 0 links nowhere (`jalr rs` is
+                    // encoded with rd = 31), as on MIPS and in PPSSPP.
+                    const std::uint32_t link = decoded.rd;
                     body << "    jump_target = " << reg(decoded.rs) << ";\n";
-                    if (decoded.kind == psprecomp::OpcodeKind::Jalr) {
+                    if (decoded.kind == psprecomp::OpcodeKind::Jalr && link != 0u) {
                         body << "    ctx.set_gpr(" << link << ", " << psprecomp::hex32(pc + 8u) << "u);\n";
                     }
                     body << emit_regular(slot, pc + 4u);

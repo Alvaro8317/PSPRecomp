@@ -68,6 +68,19 @@ struct alignas(16) AllegrexContext {
         return (integral & 1LL) == 0LL ? lower : lower + 1.0;
     }
 
+    // x86's truncating conversion (cvttsd2si): NaN and values outside the
+    // int32 range give INT_MIN. The PPSSPP interpreter, the reference for
+    // what a PSP does here, converts with it after a float-precision rounding
+    // step, so the FPU conversions below reproduce it explicitly.
+    static std::int32_t x86_truncate_to_word(double value) noexcept {
+        if (!(value > -2147483649.0 && value < 2147483648.0)) return std::numeric_limits<std::int32_t>::min();
+        return static_cast<std::int32_t>(value);
+    }
+
+    // ROUND/TRUNC/CEIL/FLOOR.W.S (modes 0-3) and CVT.W.S (mode 4, rounding
+    // from FCR31), as PPSSPP's Int_FPU2op: infinities saturate, NaN gives
+    // INT_MAX, ROUND adds 0.5 in float before flooring, TRUNC of a positive
+    // overflow gives INT_MAX and every other overflow INT_MIN.
     [[nodiscard]] std::uint32_t fpu_float_to_word(float value, std::uint32_t mode) const noexcept {
         if (!std::isfinite(value)) {
             const std::int32_t result = std::isinf(value) && std::signbit(value)
@@ -76,66 +89,53 @@ struct alignas(16) AllegrexContext {
             return static_cast<std::uint32_t>(result);
         }
 
-        double converted{};
+        std::int32_t result{};
         switch (mode) {
-        case 0u:
-            converted = std::floor(static_cast<double>(value) + 0.5);
-            break; // ROUND.W.S
-        case 1u:
-            converted = std::trunc(static_cast<double>(value));
-            break; // TRUNC.W.S
-        case 2u:
-            converted = std::ceil(static_cast<double>(value));
-            break; // CEIL.W.S
-        case 3u:
-            converted = std::floor(static_cast<double>(value));
-            break; // FLOOR.W.S
-        default:
+        case 0u: { // ROUND.W.S
+            const float biased = value + 0.5f;
+            result = x86_truncate_to_word(static_cast<double>(std::floor(biased)));
+            break;
+        }
+        case 1u: // TRUNC.W.S
+            if (value >= 0.0f) {
+                result = x86_truncate_to_word(static_cast<double>(std::floor(value)));
+                if (result == std::numeric_limits<std::int32_t>::min()) result = std::numeric_limits<std::int32_t>::max();
+            } else {
+                result = x86_truncate_to_word(static_cast<double>(std::ceil(value)));
+            }
+            break;
+        case 2u: // CEIL.W.S
+            result = x86_truncate_to_word(static_cast<double>(std::ceil(value)));
+            break;
+        case 3u: // FLOOR.W.S
+            result = x86_truncate_to_word(static_cast<double>(std::floor(value)));
+            break;
+        default: // CVT.W.S
             switch (fcr31 & 3u) {
             case 0u:
-                converted = round_ties_to_even(static_cast<double>(value));
+                result = x86_truncate_to_word(round_ties_to_even(static_cast<double>(value)));
                 break;
             case 1u:
-                converted = std::trunc(static_cast<double>(value));
+                result = x86_truncate_to_word(static_cast<double>(value));
                 break;
             case 2u:
-                converted = std::ceil(static_cast<double>(value));
+                result = x86_truncate_to_word(static_cast<double>(std::ceil(value)));
                 break;
             default:
-                converted = std::floor(static_cast<double>(value));
+                result = x86_truncate_to_word(static_cast<double>(std::floor(value)));
                 break;
             }
             break;
         }
-        return static_cast<std::uint32_t>(clamp_fpu_word(converted));
+        return static_cast<std::uint32_t>(result);
     }
 
     // Generated ROUND/TRUNC/CEIL/FLOOR instructions carry a literal conversion
-    // mode. Make it a template parameter so the hot AOT path has no mode switch;
-    // TRUNC (a common generated-code case) also avoids a redundant std::trunc.
+    // mode. Make it a template parameter so the hot AOT path has no mode switch.
     template <std::uint32_t Mode>
     [[nodiscard]] PSPRECOMP_CONTEXT_FORCEINLINE std::uint32_t fpu_float_to_word_ct(float value) const noexcept {
         static_assert(Mode <= 3u);
-        if (!std::isfinite(value)) {
-            const std::int32_t result = std::isinf(value) && std::signbit(value)
-                ? std::numeric_limits<std::int32_t>::min()
-                : std::numeric_limits<std::int32_t>::max();
-            return static_cast<std::uint32_t>(result);
-        }
-        const double input = static_cast<double>(value);
-        if constexpr (Mode == 1u) {
-            constexpr double min_value = static_cast<double>(std::numeric_limits<std::int32_t>::min());
-            constexpr double max_value = static_cast<double>(std::numeric_limits<std::int32_t>::max());
-            if (input <= min_value) return static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::min());
-            if (input >= max_value) return static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max());
-            return static_cast<std::uint32_t>(static_cast<std::int32_t>(input));
-        } else if constexpr (Mode == 0u) {
-            return static_cast<std::uint32_t>(clamp_fpu_word(std::floor(input + 0.5)));
-        } else if constexpr (Mode == 2u) {
-            return static_cast<std::uint32_t>(clamp_fpu_word(std::ceil(input)));
-        } else {
-            return static_cast<std::uint32_t>(clamp_fpu_word(std::floor(input)));
-        }
+        return fpu_float_to_word(value, Mode);
     }
 
     static constexpr std::size_t vfpu_scalar_index(std::uint32_t scalar_register) noexcept {

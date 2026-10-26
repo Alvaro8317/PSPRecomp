@@ -504,7 +504,7 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction 
             ctx.hi = static_cast<std::uint32_t>(dividend);
         } else if (dividend == std::numeric_limits<std::int32_t>::min() && divisor == -1) {
             ctx.lo = 0x80000000u;
-            ctx.hi = 0u;
+            ctx.hi = 0xFFFFFFFFu;
         } else {
             ctx.lo = static_cast<std::uint32_t>(dividend / divisor);
             ctx.hi = static_cast<std::uint32_t>(dividend % divisor);
@@ -513,7 +513,7 @@ bool execute_simple(Runtime &rt, AllegrexContext &ctx, const DecodedInstruction 
     }
     case OpcodeKind::Divu:
         if (rt_value == 0u) {
-            ctx.lo = 0xFFFFFFFFu;
+            ctx.lo = rs <= 0xFFFFu ? 0xFFFFu : 0xFFFFFFFFu;
             ctx.hi = rs;
         } else {
             ctx.lo = rs / rt_value;
@@ -1072,7 +1072,8 @@ InterpreterExit interpret_allegrex(Runtime &rt, AllegrexContext &ctx, std::uint6
             // Both operands are read before the delay slot runs, so a slot that
             // overwrites rs or the link register cannot change the transfer.
             const std::uint32_t jump_target = ctx.gpr[decoded.rs];
-            if (decoded.kind == OpcodeKind::Jalr) ctx.set_gpr(decoded.rd == 0u ? 31u : decoded.rd, return_pc);
+            // rd = 0 links nowhere (`jalr rs` is encoded with rd = 31).
+            if (decoded.kind == OpcodeKind::Jalr) ctx.set_gpr(decoded.rd, return_pc);
             next = jump_target;
             break;
         }
