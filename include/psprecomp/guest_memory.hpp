@@ -27,6 +27,11 @@ public:
     static constexpr std::uint32_t kVramMirrorCount = 4u;
     static constexpr std::uint32_t kVramAddressSpan = kVramSize * kVramMirrorCount;
     static constexpr std::uint32_t kPhysicalBase = 0x08000000u;
+    // The 16 KiB scratchpad (on-chip RAM) at 0x00010000; its 0x4xxxxxxx and
+    // 0x8xxxxxxx aliases canonicalize onto it like RAM's.  Only the slow paths
+    // reach it: guest code uses it far less than main RAM.
+    static constexpr std::uint32_t kScratchpadBase = 0x00010000u;
+    static constexpr std::uint32_t kScratchpadSize = 16u * 1024u;
 
     explicit GuestMemory(std::uint32_t size_bytes = 32u * 1024u * 1024u);
 
@@ -242,7 +247,7 @@ public:
     [[nodiscard]] const std::vector<std::uint8_t> &vram_bytes() const noexcept;
 
 private:
-    enum class Region { Vram, Ram };
+    enum class Region { Vram, Ram, Scratchpad };
     struct ResolvedAddress {
         Region region;
         std::size_t offset;
@@ -250,6 +255,9 @@ private:
 
     [[nodiscard]] ResolvedAddress resolve(std::uint32_t address, std::size_t length) const;
     [[nodiscard]] bool is_vram_window(std::uint32_t canonical_address) const noexcept;
+    [[nodiscard]] static constexpr bool is_scratchpad(std::uint32_t canonical_address) noexcept {
+        return canonical_address >= kScratchpadBase && canonical_address < kScratchpadBase + kScratchpadSize;
+    }
     [[nodiscard]] std::size_t vram_offset(std::uint32_t canonical_address) const noexcept;
     [[nodiscard]] const std::vector<std::uint8_t> &region_bytes(Region region) const noexcept;
     [[nodiscard]] std::vector<std::uint8_t> &region_bytes(Region region) noexcept;
@@ -299,6 +307,7 @@ private:
 
     std::vector<std::uint8_t> vram_;
     std::vector<std::uint8_t> bytes_;
+    std::vector<std::uint8_t> scratchpad_;
     // Cached view of bytes_ for the inline fast paths.  Neither region is ever
     // resized after construction, so these stay valid for the object's life.
     //

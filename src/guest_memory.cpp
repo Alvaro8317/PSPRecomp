@@ -84,7 +84,7 @@ void set_write_watch(std::uint32_t address, std::uint32_t size) {
 }
 
 GuestMemory::GuestMemory(std::uint32_t size_bytes)
-    : vram_(kVramSize, 0u), bytes_(size_bytes, 0u),
+    : vram_(kVramSize, 0u), bytes_(size_bytes, 0u), scratchpad_(kScratchpadSize, 0u),
       write_watch_enabled_(std::getenv("PSPRECOMP_WATCH_WRITE") != nullptr) {
     if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {
         throw Error("PSP RAM size must be 32 MiB or 64 MiB");
@@ -117,22 +117,26 @@ bool GuestMemory::contains(std::uint32_t address, std::size_t length) const noex
     const std::uint64_t end = static_cast<std::uint64_t>(c) + static_cast<std::uint64_t>(length);
     if (is_vram_window(c) && end <= static_cast<std::uint64_t>(kVramPhysicalBase) + kVramAddressSpan) return true;
     if (c >= kPhysicalBase && end <= static_cast<std::uint64_t>(kPhysicalBase) + bytes_.size()) return true;
+    if (is_scratchpad(c) && end <= static_cast<std::uint64_t>(kScratchpadBase) + kScratchpadSize) return true;
     return false;
 }
 
 GuestMemory::ResolvedAddress GuestMemory::resolve(std::uint32_t address, std::size_t length) const {
     if (!contains(address, length)) {
-        throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+        throw Error("Guest memory access outside PSP RAM/EDRAM/scratchpad at " + hex32(address));
     }
     const std::uint32_t c = canonical(address);
     if (is_vram_window(c)) return {Region::Vram, vram_offset(c)};
+    if (is_scratchpad(c)) return {Region::Scratchpad, static_cast<std::size_t>(c - kScratchpadBase)};
     return {Region::Ram, static_cast<std::size_t>(c - kPhysicalBase)};
 }
 
 const std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) const noexcept {
+    if (region == Region::Scratchpad) return scratchpad_;
     return region == Region::Vram ? vram_ : bytes_;
 }
 std::vector<std::uint8_t> &GuestMemory::region_bytes(Region region) noexcept {
+    if (region == Region::Scratchpad) return scratchpad_;
     return region == Region::Vram ? vram_ : bytes_;
 }
 
@@ -162,7 +166,8 @@ void trace_vram_read(std::uint32_t canonical_address) {
 
 // The `_slow` bodies below are the original aot_* implementations, reached only
 // when the inline main-RAM fast path in the header declines the access: EDRAM,
-// an out-of-range address, a region-crossing width, or an armed write watch.
+// the scratchpad (through the generic accessors at the end), an out-of-range
+// address, a region-crossing width, or an armed write watch.
 std::uint8_t GuestMemory::aot_load8_slow(std::uint32_t address) const {
     const std::uint32_t c = canonical(address);
     if (is_vram_window(c)) {
@@ -361,6 +366,11 @@ const std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t 
         if (offset + length <= vram_.size()) return vram_.data() + offset;
         return nullptr;
     }
+    if (is_scratchpad(c)) {
+        const std::size_t offset = static_cast<std::size_t>(c - kScratchpadBase);
+        if (offset + length <= scratchpad_.size()) return scratchpad_.data() + offset;
+        return nullptr;
+    }
     if (c < kPhysicalBase) return nullptr;
     const std::size_t offset = static_cast<std::size_t>(c - kPhysicalBase);
     if (offset + length <= bytes_.size()) return bytes_.data() + offset;
@@ -443,7 +453,7 @@ void GuestMemory::memory_barrier() const noexcept {
 }
 void GuestMemory::copy_in(std::uint32_t address, std::span<const std::uint8_t> source) {
     if (!contains(address, source.size()))
-        throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+        throw Error("Guest memory access outside PSP RAM/EDRAM/scratchpad at " + hex32(address));
     log_write_watch(address, source.size(), "copy_in", 0u, 0u);
     std::size_t copied = 0u;
     while (copied < source.size()) {
@@ -458,7 +468,7 @@ void GuestMemory::copy_in(std::uint32_t address, std::span<const std::uint8_t> s
 }
 void GuestMemory::copy_out(std::uint32_t address, std::span<std::uint8_t> destination) const {
     if (!contains(address, destination.size()))
-        throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+        throw Error("Guest memory access outside PSP RAM/EDRAM/scratchpad at " + hex32(address));
     std::size_t copied = 0u;
     while (copied < destination.size()) {
         const std::uint32_t current = address + static_cast<std::uint32_t>(copied);
@@ -471,7 +481,7 @@ void GuestMemory::copy_out(std::uint32_t address, std::span<std::uint8_t> destin
     }
 }
 void GuestMemory::zero(std::uint32_t address, std::size_t length) {
-    if (!contains(address, length)) throw Error("Guest memory access outside PSP RAM/EDRAM at " + hex32(address));
+    if (!contains(address, length)) throw Error("Guest memory access outside PSP RAM/EDRAM/scratchpad at " + hex32(address));
     log_write_watch(address, length, "zero", 0u, 0u);
     std::size_t cleared = 0u;
     while (cleared < length) {

@@ -10,6 +10,7 @@
 #include "psprecomp/runtime.hpp"
 #include "psprecomp/sha256.hpp"
 
+#include <cstring>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -1060,6 +1061,44 @@ static std::vector<std::uint8_t> make_function_pointer_test_elf() {
     return bytes;
 }
 
+// The 16 KiB scratchpad at 0x00010000, through every access path and alias.
+static void test_scratchpad() {
+    psprecomp::GuestMemory mem;
+    mem.store32(0x00010000u, 0x11223344u);
+    require(mem.load32(0x40010000u) == 0x11223344u, "Scratchpad uncached alias failed");
+    require(mem.load8(0x80010001u) == 0x33u, "Scratchpad kernel alias failed");
+    mem.store16(0x00013FFEu, 0xBEEFu);
+    require(mem.load16(0x00013FFEu) == 0xBEEFu, "Scratchpad last halfword failed");
+    // Generated code reaches it through the AOT slow paths.
+    mem.aot_store32(0x00012000u, 0xCAFEF00Du);
+    require(mem.aot_load32(0x00012000u) == 0xCAFEF00Du, "Scratchpad AOT word failed");
+    mem.aot_store8(0x00012004u, 0x5Au);
+    require(mem.aot_load8(0x00012004u) == 0x5Au, "Scratchpad AOT byte failed");
+    mem.aot_store16(0x00012006u, 0x1234u);
+    require(mem.aot_load16(0x00012006u) == 0x1234u, "Scratchpad AOT halfword failed");
+    require(mem.aot_load_word_left(0x00012003u, 0u) == 0xCAFEF00Du, "Scratchpad lwl failed");
+    require(mem.raw_pointer(0x00010000u, 0x4000u) != nullptr, "Scratchpad raw pointer failed");
+    require(mem.raw_pointer(0x00010001u, 0x4000u) == nullptr, "Scratchpad raw pointer overrun");
+    require(mem.contains(0x00013FFCu, 4u) && !mem.contains(0x00013FFDu, 4u), "Scratchpad upper bound failed");
+    require(!mem.contains(0x0000FFFFu) && !mem.contains(0x00014000u), "Scratchpad bounds failed");
+    const std::uint8_t pattern[6] = {1, 2, 3, 4, 5, 6};
+    mem.copy_in(0x00011000u, pattern);
+    std::uint8_t back[6]{};
+    mem.copy_out(0x00011000u, back);
+    require(std::memcmp(pattern, back, sizeof(back)) == 0, "Scratchpad copy failed");
+    mem.zero(0x00011000u, 3u);
+    require(mem.load32(0x00011000u) == 0x04000000u, "Scratchpad zero failed");
+    bool threw = false;
+    try {
+        (void)mem.load32(0x00014000u);
+    } catch (const psprecomp::Error &) {
+        threw = true;
+    }
+    require(threw, "Access past the scratchpad did not fail");
+    // RAM is untouched by all of this.
+    require(mem.load32(0x08000000u) == 0u, "Scratchpad aliased RAM");
+}
+
 static void test_materialized_function_pointer_discovery() {
     auto elf = psprecomp::Elf32Image::from_bytes(make_function_pointer_test_elf(), "function_pointer.elf");
     psprecomp::GuestMemory memory;
@@ -1475,6 +1514,7 @@ int main() {
         test_interpreter_vfpu_executor();
         test_run_until();
         test_import_slots_shared_by_corpora();
+        test_scratchpad();
 
         psprecomp::GuestMemory mem;
         mem.store32(0x08800000u, 0x12345678u);
